@@ -34,7 +34,7 @@ function getLocalIP() {
 
 function getBaseUrl() {
   const localIP = getLocalIP();
-  const port = process.env.WEBHOOK_PORT || 3000;
+  const port = process.env.PORT || process.env.WEBHOOK_PORT || 3000;
   return (process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`).replace(/\/$/, "");
 }
 

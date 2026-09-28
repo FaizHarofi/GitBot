@@ -58,6 +58,9 @@ if (missingEnv.length) {
   process.exit(1);
 }
 
+// Render/Railway inject PORT — prefer it over WEBHOOK_PORT
+const PORT = parseInt(process.env.PORT || process.env.WEBHOOK_PORT || "3000", 10);
+
 // ─── Local IP detection ──────────────────────────────────────────────────────
 
 function getLocalIP() {
@@ -117,7 +120,7 @@ function buildStatusEmbed() {
       { name: "🟢 Bot", value: `**${client.user.tag}**`, inline: false },
       { name: "⏱️ Uptime", value: `${h}h ${m}m ${s}s`, inline: true },
       { name: "📡 WS Ping", value: `${client.ws.ping}ms`, inline: true },
-      { name: "📦 Port", value: String(process.env.WEBHOOK_PORT || 3000), inline: true },
+      { name: "📦 Port", value: String(PORT), inline: true },
       { name: "📬 Received", value: String(stats.eventsReceived), inline: true },
       { name: "✉️ Sent", value: String(stats.eventsSent), inline: true },
       { name: "🔇 Muted", value: String(stats.eventsMuted), inline: true },
@@ -436,7 +439,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       const localIP = getLocalIP();
-      const port = process.env.WEBHOOK_PORT || 3000;
+      const port = PORT;
       const baseUrl = process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`;
 
       const testEmbed = new EmbedBuilder()
@@ -821,7 +824,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       const localIP = getLocalIP();
-      const port = process.env.WEBHOOK_PORT || 3000;
+      const port = PORT;
       const baseUrl = process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`;
 
       const resendEmbed = new EmbedBuilder()
@@ -1056,7 +1059,7 @@ client.once("ready", async () => {
   githubPoller.start();
 
   const localIP = getLocalIP();
-  const port = process.env.WEBHOOK_PORT || 3000;
+  const port = PORT;
   const baseUrl = process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`;
 
   console.log(`✅ GitBot V4 logged in as ${client.user.tag}`);
@@ -1084,7 +1087,7 @@ client.on("guildCreate", async (guild) => {
     const systemChannel = guild.systemChannel;
     if (systemChannel) {
       const localIP = getLocalIP();
-      const port = process.env.WEBHOOK_PORT || 3000;
+      const port = PORT;
       const baseUrl = process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`;
 
       const welcomeEmbed = new EmbedBuilder()
@@ -1135,8 +1138,6 @@ const webhookRouter = createWebhookRouter(client);
 app.use(webhookRouter);
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-
-const PORT = parseInt(process.env.WEBHOOK_PORT || "3000", 10);
 
 app.listen(PORT, () => {
   const localIP = getLocalIP();
