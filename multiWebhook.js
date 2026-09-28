@@ -1,39 +1,45 @@
-// multiWebhook.js — Express webhook server with multi-repo support
-// Routes webhooks to the correct repository based on URL path or payload
+// multiWebhook.js — Express webhook server (multi-tenant)
+// Routes webhooks to the correct repository and guild based on repo ID
 
 "use strict";
 
 const express = require("express");
-const crypto  = require("crypto");
+const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
+const { EmbedBuilder } = require("discord.js");
 
-const db       = require("./database");
+const db = require("./database");
 const { buildEmbed } = require("./embeds");
-const digest   = require("./digest");
-const mutes    = require("./mutes");
+const digest = require("./digest");
+const mutes = require("./mutes");
 
-// ─── Stats (shared with main) ─────────────────────────────────────────────────
+// ─── Stats ───────────────────────────────────────────────────────────────────
 
 const stats = {
   eventsReceived: 0,
-  eventsSent:     0,
-  eventsDropped:  0,
-  eventsIgnored:  0,
-  eventsMuted:    0,
+  eventsSent: 0,
+  eventsDropped: 0,
+  eventsIgnored: 0,
+  eventsMuted: 0,
+  startTime: Date.now(),
+  lastEvent: null,
+  lastEventTime: null,
+  eventCounts: {},
 };
 
 function recordEvent(eventType, outcome) {
   stats.eventsReceived++;
-  if      (outcome === "sent")    stats.eventsSent++;
+  stats.lastEvent = eventType;
+  stats.lastEventTime = new Date();
+  stats.eventCounts[eventType] = (stats.eventCounts[eventType] || 0) + 1;
+  if (outcome === "sent") stats.eventsSent++;
   else if (outcome === "dropped") stats.eventsDropped++;
-  else if (outcome === "muted")   stats.eventsMuted++;
-  else                            stats.eventsIgnored++;
+  else if (outcome === "muted") stats.eventsMuted++;
+  else stats.eventsIgnored++;
 }
 
 // ─── Signature Verification ───────────────────────────────────────────────────
 
-/**
- * Verify GitHub webhook signature
- */
 function verifySignature(rawBody, signature, secret) {
   if (!secret) return true;
   if (!signature) return false;
@@ -45,136 +51,186 @@ function verifySignature(rawBody, signature, secret) {
   }
 }
 
+// ─── Rate Limiters ───────────────────────────────────────────────────────────
+
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.WEBHOOK_RATE_LIMIT || "30", 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too many webhook requests. GitHub will retry automatically.",
+    retryAfter: "Check X-RateLimit-Reset header",
+  },
+  keyGenerator: (req) => {
+    const forwarded = req.headers["x-forwarded-for"];
+    if (forwarded) {
+      return forwarded.split(",")[0].trim();
+    }
+    return req.ip || "unknown";
+  },
+});
+
+const healthLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.HEALTH_RATE_LIMIT || "60", 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many health check requests." },
+});
+
 // ─── Webhook Router ───────────────────────────────────────────────────────────
 
-/**
- * Create webhook router for a Discord client
- */
-function createWebhookRouter(client, getChannel) {
+function createWebhookRouter(client) {
   const router = express.Router();
-  
-  // Raw body parser for signature verification
+
   router.use(express.json({
     verify: (req, _res, buf) => { req.rawBody = buf; },
   }));
-  
-  // Health check — used by monitoring tools and the /help troubleshooting guide
-  router.get("/health", (_req, res) => {
-    res.json({
-      status:   "ok",
-      version:  "3.0.1",
-      mode:     "multi-repo",
-      bot:      client.isReady() ? "connected" : "disconnected",
-      uptime:   process.uptime(),
-      repos:    db.getAllRepositories().length,
-      polling:  db.getPollableRepositories().length,
-      mutes:    mutes.list().map(m => ({
-        event:     m.eventType,
-        expiresAt: m.expiresAt,
-        reason:    m.reason,
-      })),
-      stats: {
-        eventsReceived: stats.eventsReceived,
-        eventsSent:     stats.eventsSent,
-        eventsDropped:  stats.eventsDropped,
-        eventsIgnored:  stats.eventsIgnored,
-        eventsMuted:    stats.eventsMuted,
-      },
-    });
+
+  // Health check
+  router.get("/health", healthLimiter, async (_req, res) => {
+    try {
+      const allGuilds = await db.getAllGuilds();
+      let totalRepos = 0;
+      let totalPollable = 0;
+
+      for (const guild of allGuilds) {
+        const repos = await db.getAllRepositories(guild.id);
+        const pollable = await db.getPollableRepositories(guild.id);
+        totalRepos += repos.length;
+        totalPollable += pollable.length;
+      }
+
+      res.json({
+        status: "ok",
+        version: "4.0.0",
+        mode: "multi-tenant",
+        rateLimit: {
+          webhookMax: parseInt(process.env.WEBHOOK_RATE_LIMIT || "30", 10),
+          healthMax: parseInt(process.env.HEALTH_RATE_LIMIT || "60", 10),
+        },
+        bot: client.isReady() ? "connected" : "disconnected",
+        uptime: process.uptime(),
+        guilds: allGuilds.length,
+        repos: totalRepos,
+        polling: totalPollable,
+        mutes: mutes.list().map(m => ({
+          event: m.eventType,
+          expiresAt: m.expiresAt,
+          reason: m.reason,
+        })),
+        stats: {
+          eventsReceived: stats.eventsReceived,
+          eventsSent: stats.eventsSent,
+          eventsDropped: stats.eventsDropped,
+          eventsIgnored: stats.eventsIgnored,
+          eventsMuted: stats.eventsMuted,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   });
-  
-  // Main webhook endpoint (legacy - uses default channel)
-  router.post("/webhook", (req, res) => handleWebhook(req, res, client, null, getChannel));
-  
+
   // Per-repository webhook: /webhook/:repoId
-  router.post("/webhook/:repoId", (req, res) => {
+  router.post("/webhook/:repoId", webhookLimiter, (req, res) => {
     const repoId = parseInt(req.params.repoId, 10);
     if (isNaN(repoId)) {
       return res.status(400).send("Invalid repository ID");
     }
-    handleWebhook(req, res, client, repoId, getChannel);
+    handleWebhook(req, res, client, repoId);
   });
-  
-  // Per-repository webhook by name: /webhook/owner/repo
-  router.post("/webhook/:owner/:repo", (req, res) => {
-    const { owner, repo } = req.params;
-    const repoData = db.getRepositoryByFullName(`${owner}/${repo}`);
-    if (!repoData) {
-      return res.status(404).send("Repository not found");
+
+  // Per-repository webhook by name: /webhook/:owner/:repo
+  router.post("/webhook/:owner/:repo", webhookLimiter, async (req, res) => {
+    const { owner, repo: repoName } = req.params;
+    const fullName = `${owner}/${repoName}`;
+
+    // Search across all guilds
+    const allGuilds = await db.getAllGuilds();
+    for (const guild of allGuilds) {
+      const repoData = await db.getRepositoryByFullName(guild.id, fullName);
+      if (repoData) {
+        return handleWebhook(req, res, client, repoData.id);
+      }
     }
-    handleWebhook(req, res, client, repoData.id, getChannel);
+
+    return res.status(404).send("Repository not found");
   });
-  
+
   return router;
 }
 
-/**
- * Main webhook handler
- */
-async function handleWebhook(req, res, client, repoId, getChannel) {
-  if (!client.isReady()) {
-    return res.status(503).send("Bot not ready");
-  }
-  
-  const sig       = req.headers["x-hub-signature-256"];
+// ─── Main webhook handler ─────────────────────────────────────────────────────
+
+async function handleWebhook(req, res, client, repoId) {
+  const sig = req.headers["x-hub-signature-256"];
   const eventType = req.headers["x-github-event"];
-  const payload   = req.body;
-  
+  const payload = req.body;
+
   if (!eventType) {
     return res.status(400).send("Missing X-GitHub-Event header");
   }
-  
-  // Respond immediately — GitHub's delivery timeout is 10s
-  res.status(200).send("OK");
-  
-  // If no specific repo, try to find by payload
+
+  // Look up repo by ID (includes guild_id from the join)
   let repo = null;
   if (repoId) {
-    repo = db.getRepositoryById(repoId);
+    repo = await db.getRepositoryById(repoId);
   } else {
-    // Try to find repo from payload
     const repoFullName = payload?.repository?.full_name;
     if (repoFullName) {
-      repo = db.getRepositoryByFullName(repoFullName);
+      // Search across all guilds
+      const allGuilds = await db.getAllGuilds();
+      for (const guild of allGuilds) {
+        repo = await db.getRepositoryByFullName(guild.id, repoFullName);
+        if (repo) break;
+      }
     }
   }
-  
-  // If still no repo, fall back to legacy behavior (config-based)
+
   if (!repo) {
-    console.log(`[webhook] No repo found, using legacy routing for ${eventType}`);
-    return handleLegacyWebhook(req, res, client, getChannel);
+    console.log(`[webhook] No repo found for ID ${repoId}, ignoring`);
+    digest.push(eventType, payload, "ignored");
+    recordEvent(eventType, "ignored");
+    return res.status(404).send("Repository not found");
   }
-  
-  // Check if repo is active
+
   if (!repo.is_active) {
     console.log(`[webhook] Repo ${repo.full_name} is inactive, skipping`);
     digest.push(eventType, payload, "ignored");
     recordEvent(eventType, "ignored");
-    return;
+    return res.status(410).send("Repository inactive");
   }
-  
+
   // Verify webhook secret if configured
   if (repo.webhook_secret) {
     if (!verifySignature(req.rawBody, sig, repo.webhook_secret)) {
       console.warn(`[webhook] Invalid signature for ${repo.full_name} - rejecting`);
       digest.push(eventType, payload, "ignored");
       recordEvent(eventType, "ignored");
-      return;
+      return res.status(401).send("Invalid signature");
     }
   } else {
-    // No secret configured - still accept (for backward compatibility)
-    console.log(`[webhook] No secret configured for ${repo.full_name} - accepting without verification`);
+    console.log(`[webhook] No secret for ${repo.full_name} — accepting`);
   }
-  
-  console.log(`[webhook] ${eventType} from ${repo.full_name} (action: ${payload.action || "n/a"})`);
 
-  // ── Handle ping (GitHub fires this when a webhook is first saved) ──────────
+  // Respond immediately — GitHub's delivery timeout is 10s
+  res.status(200).send("OK");
+
+  console.log(`[webhook] ${eventType} from ${repo.full_name} (guild: ${repo.guild_id}, action: ${payload.action || "n/a"})`);
+
+  if (!client.isReady()) {
+    return;
+  }
+
+  // Handle ping
   if (eventType === "ping") {
-    console.log(`[webhook] 🏓 Ping received for ${repo.full_name} — webhook is live`);
+    console.log(`[webhook] Ping received for ${repo.full_name} — webhook is live`);
     try {
       const channel = await client.channels.fetch(repo.channel_id);
       if (channel) {
-        const pingEmbed = new (require("discord.js").EmbedBuilder)()
+        const pingEmbed = new EmbedBuilder()
           .setColor(0x2ECC71)
           .setTitle("🏓 GitHub Ping Received")
           .setDescription(
@@ -183,7 +239,7 @@ async function handleWebhook(req, res, client, repoId, getChannel) {
           )
           .addFields(
             { name: "Repository", value: `[${repo.full_name}](${payload.repository?.html_url || `https://github.com/${repo.full_name}`})`, inline: true },
-            { name: "Hook ID",    value: String(payload.hook_id || "—"), inline: true },
+            { name: "Hook ID", value: String(payload.hook_id || "—"), inline: true },
           )
           .setFooter({ text: "Waiting for you to click ✅ I've added the webhook in your DM" })
           .setTimestamp();
@@ -199,15 +255,13 @@ async function handleWebhook(req, res, client, repoId, getChannel) {
   }
 
   try {
-    // Check if event is muted
     if (mutes.isMuted(eventType)) {
       console.log(`[webhook] "${eventType}" muted — skipping post`);
       digest.push(eventType, payload, "muted", repo.full_name);
       recordEvent(eventType, "muted");
       return;
     }
-    
-    // Build embed
+
     const embed = buildEmbed(eventType, payload);
     if (!embed) {
       console.log(`[webhook] No embed for "${eventType}" action="${payload.action}" — skipping`);
@@ -215,14 +269,12 @@ async function handleWebhook(req, res, client, repoId, getChannel) {
       recordEvent(eventType, "ignored");
       return;
     }
-    
-    // Add repository info to embed
+
     embed.setFooter({
       text: `Repository: ${repo.full_name}`,
       iconURL: payload.repository?.owner?.avatar_url || undefined,
     });
-    
-    // Get channel
+
     const channelId = repo.channel_id;
     if (!channelId) {
       console.log(`[webhook] No channel configured for ${repo.full_name}`);
@@ -230,7 +282,7 @@ async function handleWebhook(req, res, client, repoId, getChannel) {
       recordEvent(eventType, "dropped");
       return;
     }
-    
+
     const channel = await client.channels.fetch(channelId);
     if (!channel) {
       console.error(`[webhook] Channel ${channelId} not found for ${repo.full_name}`);
@@ -238,13 +290,12 @@ async function handleWebhook(req, res, client, repoId, getChannel) {
       recordEvent(eventType, "dropped");
       return;
     }
-    
-    // Send the embed
+
     await channel.send({ embeds: [embed] });
     digest.push(eventType, payload, "sent", repo.full_name);
     recordEvent(eventType, "sent");
-    console.log(`[webhook] ✉️  "${eventType}" from ${repo.full_name} → #${channel.name}`);
-    
+    console.log(`[webhook] "${eventType}" from ${repo.full_name} → #${channel.name}`);
+
   } catch (err) {
     console.error(`[webhook] Error on "${eventType}" from ${repo.full_name}: ${err.message}`);
     digest.push(eventType, payload, "dropped", repo.full_name);
@@ -252,105 +303,47 @@ async function handleWebhook(req, res, client, repoId, getChannel) {
   }
 }
 
-/**
- * Legacy webhook handler (config.json based routing)
- */
-async function handleLegacyWebhook(req, res, client, getChannel) {
-  const sig       = req.headers["x-hub-signature-256"];
-  const eventType = req.headers["x-github-event"];
-  const payload   = req.body;
-  
-  if (!verifySignature(req.rawBody, sig, process.env.GITHUB_WEBHOOK_SECRET)) {
-    console.warn("[webhook] Invalid signature — rejected");
-    return;
-  }
-  
-  console.log(`[webhook] (legacy) ${eventType}`);
-  
-  try {
-    // Load legacy config
-    const fs = require("fs");
-    const path = require("path");
-    const CONFIG_PATH = path.join(__dirname, "config.json");
-    delete require.cache[require.resolve(CONFIG_PATH)];
-    const cfg = require(CONFIG_PATH);
-    
-    const channelName = cfg.channels?.[eventType];
-    if (!channelName) {
-      console.log(`[webhook] "${eventType}" unmapped — skipping`);
-      digest.push(eventType, payload, "ignored");
-      recordEvent(eventType, "ignored");
-      return;
-    }
-    
-    if (mutes.isMuted(eventType)) {
-      console.log(`[webhook] "${eventType}" muted — skipping post`);
-      digest.push(eventType, payload, "muted");
-      recordEvent(eventType, "muted");
-      return;
-    }
-    
-    const embed = buildEmbed(eventType, payload);
-    if (!embed) {
-      console.log(`[webhook] No embed for "${eventType}" — skipping`);
-      digest.push(eventType, payload, "ignored");
-      recordEvent(eventType, "ignored");
-      return;
-    }
-    
-    const channel = await getChannel(channelName);
-    if (!channel) {
-      digest.push(eventType, payload, "dropped");
-      recordEvent(eventType, "dropped");
-      return;
-    }
-    
-    await channel.send({ embeds: [embed] });
-    digest.push(eventType, payload, "sent");
-    recordEvent(eventType, "sent");
-    console.log(`[webhook] ✉️  "${eventType}" → #${channelName}`);
-    
-  } catch (err) {
-    console.error(`[webhook] Legacy error: ${err.message}`);
-    digest.push(eventType, payload, "dropped");
-    recordEvent(eventType, "dropped");
-  }
-}
-
 // ─── Event Handler for Polling ───────────────────────────────────────────────
 
-/**
- * Handle events from the poller
- */
 async function handlePolledEvent(eventType, payload, repo, client) {
   if (!repo.is_active) return;
   if (!repo.channel_id) return;
-  
-  // Check if event is muted
+
   if (mutes.isMuted(eventType)) {
     console.log(`[poller] "${eventType}" muted, skipping`);
+    digest.push(eventType, payload, "muted", repo.full_name);
+    recordEvent(eventType, "muted");
     return;
   }
-  
+
   const embed = buildEmbed(eventType, payload);
-  if (!embed) return;
-  
-  // Add repository info
+  if (!embed) {
+    digest.push(eventType, payload, "ignored", repo.full_name);
+    recordEvent(eventType, "ignored");
+    return;
+  }
+
   embed.setFooter({
     text: `Repository: ${repo.full_name} (polled)`,
   });
-  
+
   try {
     const channel = await client.channels.fetch(repo.channel_id);
     if (!channel) {
       console.error(`[poller] Channel ${repo.channel_id} not found`);
+      digest.push(eventType, payload, "dropped", repo.full_name);
+      recordEvent(eventType, "dropped");
       return;
     }
-    
+
     await channel.send({ embeds: [embed] });
-    console.log(`[poller] ✉️  "${eventType}" from ${repo.full_name} → #${channel.name}`);
+    console.log(`[poller] "${eventType}" from ${repo.full_name} → #${channel.name}`);
+    digest.push(eventType, payload, "sent", repo.full_name);
+    recordEvent(eventType, "sent");
   } catch (err) {
     console.error(`[poller] Error: ${err.message}`);
+    digest.push(eventType, payload, "dropped", repo.full_name);
+    recordEvent(eventType, "dropped");
   }
 }
 

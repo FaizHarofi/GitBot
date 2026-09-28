@@ -1,577 +1,412 @@
-// database.js — SQLite database for multi-repo support
-// Stores repositories, users, settings, and rate limit data
+// database.js — Supabase PostgreSQL database for multi-tenant GitBot
+// Stores guilds, repositories, users, tokens, and settings
 
 "use strict";
 
-const path    = require("path");
-const fs     = require("fs");
-const dbPath = path.join(__dirname, "gitbot.db");
+const { createClient } = require("@supabase/supabase-js");
 
-// Use better-sqlite3 for sync operations (faster, simpler)
-let Database;
-try {
-  Database = require("better-sqlite3");
-} catch {
-  console.warn("[db] better-sqlite3 not found, using sqlite3 (async)");
-  Database = require("sqlite3").verbose();
-}
+let supabase;
 
-let db;
+// ─── Initialization ─────────────────────────────────────────────────────────
 
 /**
- * Initialize database and create tables
+ * Initialize Supabase client
  */
 function init() {
-  // better-sqlite3 (sync) was loaded if its constructor is named "Database";
-  // sqlite3 verbose() returns an object whose constructor is named "verbose".
-  const useSync = Database.name === "Database";
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_KEY;
 
-  if (useSync) {
-    db = new Database(dbPath);
-    db.pragma("journal_mode = WAL");
-    _createTablesSync();
-  } else {
-    // For sqlite3, we'll use a Promise-based approach
-    return new Promise((resolve, reject) => {
-      db = new Database(dbPath, err => {
-        if (err) return reject(err);
-        db.run("PRAGMA journal_mode = WAL", () => {
-          _createTablesAsync(() => resolve());
-        });
-      });
-    });
+  if (!url || !key) {
+    throw new Error("SUPABASE_URL and SUPABASE_KEY must be set in .env");
   }
+
+  supabase = createClient(url, key);
+  console.log("[db] Supabase connected");
 }
 
-function _createTablesSync() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS repositories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      owner TEXT NOT NULL,
-      name TEXT NOT NULL,
-      full_name TEXT UNIQUE NOT NULL,
-      channel_id TEXT,
-      webhook_secret TEXT,
-      webhook_id TEXT,
-      github_token_id TEXT,
-      poll_enabled INTEGER DEFAULT 0,
-      last_commit_sha TEXT,
-      last_polled_at INTEGER,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      created_by TEXT,
-      is_active INTEGER DEFAULT 1,
-      error_message TEXT,
-      UNIQUE(owner, name)
-    );
-
-    CREATE TABLE IF NOT EXISTS github_tokens (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      token TEXT NOT NULL,
-      user_id TEXT,
-      description TEXT,
-      rate_limit_remaining INTEGER DEFAULT 5000,
-      rate_limit_reset INTEGER,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      is_default INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS admins (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      discord_user_id TEXT UNIQUE NOT NULL,
-      username TEXT,
-      added_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      added_by TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS repo_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      repo_id INTEGER NOT NULL,
-      event_type TEXT NOT NULL,
-      payload TEXT,
-      processed INTEGER DEFAULT 0,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (repo_id) REFERENCES repositories(id)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_repos_full_name ON repositories(full_name);
-    CREATE INDEX IF NOT EXISTS idx_repos_active ON repositories(is_active);
-    CREATE INDEX IF NOT EXISTS idx_tokens_default ON github_tokens(is_default);
-  `);
-  console.log("[db] Database initialized (sync)");
+/**
+ * Ensure a guild exists (upsert). Called on guildCreate or first interaction.
+ */
+async function ensureGuild(guildId, guildName, ownerId) {
+  const { error } = await supabase
+    .from("guilds")
+    .upsert({ id: guildId, name: guildName, owner_id: ownerId }, { onConflict: "id" });
+  if (error) throw error;
 }
 
-function _createTablesAsync(callback) {
-  db.serialize(() => {
-    db.run(`
-      CREATE TABLE IF NOT EXISTS repositories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        owner TEXT NOT NULL,
-        name TEXT NOT NULL,
-        full_name TEXT UNIQUE NOT NULL,
-        channel_id TEXT,
-        webhook_secret TEXT,
-        webhook_id TEXT,
-        github_token_id TEXT,
-        poll_enabled INTEGER DEFAULT 0,
-        last_commit_sha TEXT,
-        last_polled_at INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        created_by TEXT,
-        is_active INTEGER DEFAULT 1,
-        error_message TEXT,
-        UNIQUE(owner, name)
-      )
-    `, () => {
-      db.run(`CREATE TABLE IF NOT EXISTS github_tokens (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        token TEXT NOT NULL,
-        user_id TEXT,
-        description TEXT,
-        rate_limit_remaining INTEGER DEFAULT 5000,
-        rate_limit_reset INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        is_default INTEGER DEFAULT 0
-      )`, () => {
-        db.run(`CREATE TABLE IF NOT EXISTS admins (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          discord_user_id TEXT UNIQUE NOT NULL,
-          username TEXT,
-          added_at TEXT DEFAULT CURRENT_TIMESTAMP,
-          added_by TEXT
-        )`, () => {
-          db.run(`CREATE TABLE IF NOT EXISTS repo_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            repo_id INTEGER NOT NULL,
-            event_type TEXT NOT NULL,
-            payload TEXT,
-            processed INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (repo_id) REFERENCES repositories(id)
-          )`, () => {
-            // Create indexes (same as sync path)
-            db.run("CREATE INDEX IF NOT EXISTS idx_repos_full_name ON repositories(full_name)");
-            db.run("CREATE INDEX IF NOT EXISTS idx_repos_active ON repositories(is_active)");
-            db.run("CREATE INDEX IF NOT EXISTS idx_tokens_default ON github_tokens(is_default)", callback);
-          });
-        });
-      });
-    });
-  });
-}
-
-// ─── Repository Operations ───────────────────────────────────────────────────
+// ─── Repository Operations ──────────────────────────────────────────────────
 
 /**
  * Add a new repository to monitor
- * @param {string} owner - Repository owner
- * @param {string} name - Repository name
- * @param {string} channelId - Discord channel ID for notifications
- * @param {string} createdBy - Discord user ID who added the repo
- * @param {object} options - Optional: tokenId, webhookSecret, pollEnabled
- * @returns {object} The created repository
  */
-function addRepository(owner, name, channelId, createdBy, options = {}) {
+async function addRepository(guildId, owner, name, channelId, createdBy, options = {}) {
   const fullName = `${owner}/${name}`;
-  
-  if (db.constructor.name === "Database") {
-    // Sync mode (better-sqlite3)
-    const stmt = db.prepare(`
-      INSERT INTO repositories (owner, name, full_name, channel_id, created_by, github_token_id, webhook_secret, poll_enabled)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    
-    try {
-      const result = stmt.run(
-        owner, name, fullName, channelId, createdBy,
-        options.tokenId || null,
-        options.webhookSecret || null,
-        options.pollEnabled ? 1 : 0
-      );
-      return getRepositoryById(result.lastInsertRowid);
-    } catch (err) {
-      if (err.message.includes("UNIQUE constraint")) {
-        throw new Error(`Repository ${fullName} is already registered`);
-      }
-      throw err;
+
+  const { data, error } = await supabase
+    .from("repositories")
+    .insert({
+      guild_id: guildId,
+      owner,
+      name,
+      full_name: fullName,
+      channel_id: channelId,
+      created_by: createdBy,
+      github_token_id: options.tokenId || null,
+      webhook_secret: options.webhookSecret || null,
+      poll_enabled: options.pollEnabled || false,
+    })
+    .select()
+    .single();
+
+  if (error) {
+    if (error.code === "23505") {
+      throw new Error(`Repository ${fullName} is already registered`);
     }
-  } else {
-    // Async mode - return promise
-    return new Promise((resolve, reject) => {
-      const stmt = db.prepare(`
-        INSERT INTO repositories (owner, name, full_name, channel_id, created_by, github_token_id, webhook_secret, poll_enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      
-      stmt.run(
-        owner, name, fullName, channelId, createdBy,
-        options.tokenId || null,
-        options.webhookSecret || null,
-        options.pollEnabled ? 1 : 0,
-        function(err) {
-          if (err) {
-            if (err.message.includes("UNIQUE constraint")) {
-              return reject(new Error(`Repository ${fullName} is already registered`));
-            }
-            return reject(err);
-          }
-          resolve(_getRepositoryByIdAsync(this.lastID));
-        }
-      );
-    });
+    throw error;
   }
+  return data;
 }
 
 /**
- * Get repository by ID (sync)
+ * Get repository by ID
  */
-function getRepositoryById(id) {
-  const stmt = db.prepare("SELECT * FROM repositories WHERE id = ?");
-  return stmt.get(id);
-}
+async function getRepositoryById(id) {
+  const { data, error } = await supabase
+    .from("repositories")
+    .select("*")
+    .eq("id", id)
+    .single();
 
-// Async (sqlite3) counterpart to getRepositoryById
-function _getRepositoryByIdAsync(id) {
-  return new Promise((resolve, reject) => {
-    db.get("SELECT * FROM repositories WHERE id = ?", [id], (err, row) => {
-      if (err) return reject(err);
-      resolve(row);
-    });
-  });
+  if (error && error.code !== "PGRST116") throw error;
+  return data;
 }
 
 /**
- * Get repository by full_name (owner/name)
+ * Get repository by full_name (owner/name) within a guild
  */
-function getRepositoryByFullName(fullName) {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("SELECT * FROM repositories WHERE full_name = ?");
-    return stmt.get(fullName);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.get("SELECT * FROM repositories WHERE full_name = ?", [fullName], (err, row) => {
-        if (err) return reject(err);
-        resolve(row);
-      });
-    });
-  }
+async function getRepositoryByFullName(guildId, fullName) {
+  const { data, error } = await supabase
+    .from("repositories")
+    .select("*")
+    .eq("guild_id", guildId)
+    .eq("full_name", fullName)
+    .single();
+
+  if (error && error.code !== "PGRST116") throw error;
+  return data;
 }
 
 /**
- * Get all active repositories
+ * Get all active repositories for a guild
  */
-function getAllRepositories() {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("SELECT * FROM repositories WHERE is_active = 1 ORDER BY full_name");
-    return stmt.all();
-  } else {
-    return new Promise((resolve, reject) => {
-      db.all("SELECT * FROM repositories WHERE is_active = 1 ORDER BY full_name", (err, rows) => {
-        if (err) return reject(err);
-        resolve(rows);
-      });
-    });
-  }
+async function getAllRepositories(guildId) {
+  const { data, error } = await supabase
+    .from("repositories")
+    .select("*")
+    .eq("guild_id", guildId)
+    .eq("is_active", true)
+    .order("full_name");
+
+  if (error) throw error;
+  return data || [];
 }
 
 /**
- * Get all repositories that have polling enabled
+ * Get all guilds (used by health check and webhook routing)
  */
-function getPollableRepositories() {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("SELECT * FROM repositories WHERE is_active = 1 AND poll_enabled = 1");
-    return stmt.all();
-  } else {
-    return new Promise((resolve, reject) => {
-      db.all("SELECT * FROM repositories WHERE is_active = 1 AND poll_enabled = 1", (err, rows) => {
-        if (err) return reject(err);
-        resolve(rows);
-      });
-    });
-  }
+async function getAllGuilds() {
+  const { data, error } = await supabase.from("guilds").select("*");
+  if (error) throw error;
+  return data || [];
+}
+
+/**
+ * Get all pollable repositories across all guilds
+ */
+async function getAllPollableRepositories() {
+  const { data, error } = await supabase
+    .from("repositories")
+    .select("*, guilds!inner(id, name)")
+    .eq("is_active", true)
+    .eq("poll_enabled", true);
+
+  if (error) throw error;
+  return data || [];
+}
+
+/**
+ * Get all pollable repositories for a specific guild
+ */
+async function getPollableRepositories(guildId) {
+  const { data, error } = await supabase
+    .from("repositories")
+    .select("*")
+    .eq("guild_id", guildId)
+    .eq("is_active", true)
+    .eq("poll_enabled", true);
+
+  if (error) throw error;
+  return data || [];
 }
 
 /**
  * Update repository settings
  */
-function updateRepository(id, updates) {
-  const allowed = ["channel_id", "webhook_secret", "github_token_id", "poll_enabled", "last_commit_sha", "last_polled_at", "is_active", "error_message"];
-  const fields = [];
-  const values = [];
-  
+async function updateRepository(id, updates) {
+  const allowed = [
+    "channel_id", "webhook_secret", "github_token_id",
+    "poll_enabled", "default_branch", "last_commit_sha", "last_polled_at",
+    "is_active", "error_message",
+  ];
+
+  const patch = {};
   for (const [key, value] of Object.entries(updates)) {
     if (allowed.includes(key)) {
-      fields.push(`${key} = ?`);
-      values.push(key === "poll_enabled" || key === "is_active" ? (value ? 1 : 0) : value);
+      patch[key] = value;
     }
   }
-  
-  if (fields.length === 0) return;
-  
-  values.push(id);
-  
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare(`UPDATE repositories SET ${fields.join(", ")} WHERE id = ?`);
-    stmt.run(...values);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.run(`UPDATE repositories SET ${fields.join(", ")} WHERE id = ?`, values, err => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-  }
+
+  if (Object.keys(patch).length === 0) return;
+
+  const { error } = await supabase
+    .from("repositories")
+    .update(patch)
+    .eq("id", id);
+
+  if (error) throw error;
 }
 
 /**
- * Remove a repository
- */
-function removeRepository(idOrFullName) {
-  const isNumeric = /^\d+$/.test(String(idOrFullName));
-  const where = isNumeric ? "id = ?" : "full_name = ?";
-  
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare(`UPDATE repositories SET is_active = 0 WHERE ${where}`);
-    return stmt.run(idOrFullName);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.run(`UPDATE repositories SET is_active = 0 WHERE ${where}`, [idOrFullName], err => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
+  * Hard delete a repository (guild-scoped)
+  */
+  async function deleteRepository(idOrFullName, guildId) {
+    const isNumeric = /^\d+$/.test(String(idOrFullName));
+    const col = isNumeric ? "id" : "full_name";
+
+    const query = supabase
+      .from("repositories")
+      .delete()
+      .eq(col, idOrFullName);
+
+    if (!isNumeric && guildId) {
+      query.eq("guild_id", guildId);
+    }
+
+    const { error } = await query;
+
+    if (error) throw error;
   }
+
+// ─── Admin Operations ───────────────────────────────────────────────────────
+
+/**
+ * Add an admin (per guild)
+ */
+async function addAdmin(guildId, discordUserId, username, addedBy) {
+  const { error } = await supabase
+    .from("admins")
+    .upsert({
+      guild_id: guildId,
+      discord_user_id: discordUserId,
+      username,
+      added_by: addedBy,
+    }, { onConflict: "guild_id,discord_user_id" });
+
+  if (error) throw error;
 }
 
 /**
- * Hard delete a repository
+ * Remove an admin (per guild)
  */
-function deleteRepository(idOrFullName) {
-  const isNumeric = /^\d+$/.test(String(idOrFullName));
-  const where = isNumeric ? "id = ?" : "full_name = ?";
-  
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare(`DELETE FROM repositories WHERE ${where}`);
-    return stmt.run(idOrFullName);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.run(`DELETE FROM repositories WHERE ${where}`, [idOrFullName], err => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-  }
-}
+async function removeAdmin(guildId, discordUserId) {
+  const { error } = await supabase
+    .from("admins")
+    .delete()
+    .eq("guild_id", guildId)
+    .eq("discord_user_id", discordUserId);
 
-// ─── Admin Operations ─────────────────────────────────────────────────────────
-
-/**
- * Add an admin
- */
-function addAdmin(discordUserId, username, addedBy) {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare(`
-      INSERT OR IGNORE INTO admins (discord_user_id, username, added_by)
-      VALUES (?, ?, ?)
-    `);
-    return stmt.run(discordUserId, username, addedBy);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.run(`INSERT OR IGNORE INTO admins (discord_user_id, username, added_by) VALUES (?, ?, ?)`,
-        [discordUserId, username, addedBy], err => {
-          if (err) return reject(err);
-          resolve();
-        });
-    });
-  }
+  if (error) throw error;
 }
 
 /**
- * Remove an admin
+ * Check if user is an admin in a guild
  */
-function removeAdmin(discordUserId) {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("DELETE FROM admins WHERE discord_user_id = ?");
-    return stmt.run(discordUserId);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.run("DELETE FROM admins WHERE discord_user_id = ?", [discordUserId], err => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-  }
+async function isAdmin(guildId, discordUserId) {
+  const { data, error } = await supabase
+    .from("admins")
+    .select("id")
+    .eq("guild_id", guildId)
+    .eq("discord_user_id", discordUserId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return !!data;
 }
 
 /**
- * Check if user is an admin
+ * Get all admins for a guild
  */
-function isAdmin(discordUserId) {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("SELECT 1 FROM admins WHERE discord_user_id = ?");
-    return !!stmt.get(discordUserId);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.get("SELECT 1 FROM admins WHERE discord_user_id = ?", [discordUserId], (err, row) => {
-        if (err) return reject(err);
-        resolve(!!row);
-      });
-    });
-  }
+async function getAllAdmins(guildId) {
+  const { data, error } = await supabase
+    .from("admins")
+    .select("*")
+    .eq("guild_id", guildId)
+    .order("username");
+
+  if (error) throw error;
+  return data || [];
 }
 
-/**
- * Get all admins
- */
-function getAllAdmins() {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("SELECT * FROM admins ORDER BY username");
-    return stmt.all();
-  } else {
-    return new Promise((resolve, reject) => {
-      db.all("SELECT * FROM admins ORDER BY username", (err, rows) => {
-        if (err) return reject(err);
-        resolve(rows);
-      });
-    });
-  }
-}
-
-// ─── GitHub Token Operations ──────────────────────────────────────────────────
+// ─── GitHub Token Operations ────────────────────────────────────────────────
 
 /**
- * Add a GitHub token
+ * Add a GitHub token (per guild)
  */
-function addToken(token, userId, description, isDefault = false) {
+async function addToken(guildId, token, userId, description, isDefault = false) {
   if (isDefault) {
-    // Unset other defaults first
-    if (db.constructor.name === "Database") {
-      db.prepare("UPDATE github_tokens SET is_default = 0").run();
-    } else {
-      db.run("UPDATE github_tokens SET is_default = 0");
-    }
+    await supabase
+      .from("github_tokens")
+      .update({ is_default: false })
+      .eq("guild_id", guildId);
   }
-  
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare(`
-      INSERT INTO github_tokens (token, user_id, description, is_default)
-      VALUES (?, ?, ?, ?)
-    `);
-    return stmt.run(token, userId, description, isDefault ? 1 : 0);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.run(`INSERT INTO github_tokens (token, user_id, description, is_default) VALUES (?, ?, ?, ?)`,
-        [token, userId, description, isDefault ? 1 : 0], err => {
-          if (err) return reject(err);
-          resolve();
-        });
+
+  const { error } = await supabase
+    .from("github_tokens")
+    .insert({
+      guild_id: guildId,
+      token,
+      user_id: userId,
+      description,
+      is_default: isDefault,
     });
-  }
+
+  if (error) throw error;
 }
 
 /**
- * Get the default token
+ * Get the default token for a guild
  */
-function getDefaultToken() {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("SELECT * FROM github_tokens WHERE is_default = 1 LIMIT 1");
-    return stmt.get();
-  } else {
-    return new Promise((resolve, reject) => {
-      db.get("SELECT * FROM github_tokens WHERE is_default = 1 LIMIT 1", (err, row) => {
-        if (err) return reject(err);
-        resolve(row);
-      });
-    });
-  }
+async function getDefaultToken(guildId) {
+  const { data, error } = await supabase
+    .from("github_tokens")
+    .select("*")
+    .eq("guild_id", guildId)
+    .eq("is_default", true)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
 }
 
 /**
  * Get token by ID
  */
-function getTokenById(id) {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("SELECT * FROM github_tokens WHERE id = ?");
-    return stmt.get(id);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.get("SELECT * FROM github_tokens WHERE id = ?", [id], (err, row) => {
-        if (err) return reject(err);
-        resolve(row);
-      });
-    });
-  }
+async function getTokenById(id) {
+  const { data, error } = await supabase
+    .from("github_tokens")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
 }
 
 /**
  * Update token rate limit info
  */
-function updateTokenRateLimit(tokenId, remaining, resetTime) {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("UPDATE github_tokens SET rate_limit_remaining = ?, rate_limit_reset = ? WHERE id = ?");
-    return stmt.run(remaining, resetTime, tokenId);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.run("UPDATE github_tokens SET rate_limit_remaining = ?, rate_limit_reset = ? WHERE id = ?",
-        [remaining, resetTime, tokenId], err => {
-          if (err) return reject(err);
-          resolve();
-        });
-    });
-  }
+async function updateTokenRateLimit(tokenId, remaining, resetTime) {
+  const { error } = await supabase
+    .from("github_tokens")
+    .update({ rate_limit_remaining: remaining, rate_limit_reset: resetTime })
+    .eq("id", tokenId);
+
+  if (error) throw error;
 }
 
 /**
- * Get all tokens
+ * Get all tokens for a guild (without exposing the token value)
  */
-function getAllTokens() {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("SELECT id, user_id, description, rate_limit_remaining, rate_limit_reset, created_at, is_default FROM github_tokens");
-    return stmt.all();
-  } else {
-    return new Promise((resolve, reject) => {
-      db.all("SELECT id, user_id, description, rate_limit_remaining, rate_limit_reset, created_at, is_default FROM github_tokens",
-        (err, rows) => {
-          if (err) return reject(err);
-          resolve(rows);
-        });
-    });
-  }
+async function getAllTokens(guildId) {
+  const { data, error } = await supabase
+    .from("github_tokens")
+    .select("id, user_id, description, rate_limit_remaining, rate_limit_reset, created_at, is_default")
+    .eq("guild_id", guildId);
+
+  if (error) throw error;
+  return data || [];
 }
 
 /**
  * Remove a token
  */
-function removeToken(id) {
-  if (db.constructor.name === "Database") {
-    const stmt = db.prepare("DELETE FROM github_tokens WHERE id = ?");
-    return stmt.run(id);
-  } else {
-    return new Promise((resolve, reject) => {
-      db.run("DELETE FROM github_tokens WHERE id = ?", [id], err => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-  }
+async function removeToken(id) {
+  const { error } = await supabase
+    .from("github_tokens")
+    .delete()
+    .eq("id", id);
+
+  if (error) throw error;
+}
+
+// ─── Guild Operations ───────────────────────────────────────────────────────
+
+/**
+ * Get a guild by ID
+ */
+async function getGuild(guildId) {
+  const { data, error } = await supabase
+    .from("guilds")
+    .select("*")
+    .eq("id", guildId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Get guild webhook URL (for display)
+ */
+async function getGuildStats(guildId) {
+  const [repos, pollable, admins, tokens] = await Promise.all([
+    getAllRepositories(guildId),
+    getPollableRepositories(guildId),
+    getAllAdmins(guildId),
+    getAllTokens(guildId),
+  ]);
+
+  return {
+    repos: repos.length,
+    pollable: pollable.length,
+    admins: admins.length,
+    tokens: tokens.length,
+  };
 }
 
 module.exports = {
   init,
-  // Repository operations
+  ensureGuild,
+  // Guild
+  getGuild,
+  getAllGuilds,
+  getGuildStats,
+  // Repository
   addRepository,
   getRepositoryById,
   getRepositoryByFullName,
   getAllRepositories,
   getPollableRepositories,
+  getAllPollableRepositories,
   updateRepository,
-  removeRepository,
   deleteRepository,
-  // Admin operations
+  // Admin
   addAdmin,
   removeAdmin,
   isAdmin,
   getAllAdmins,
-  // Token operations
+  // Token
   addToken,
   getDefaultToken,
   getTokenById,

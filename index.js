@@ -1,17 +1,17 @@
-// index.js — GitBot V3
+// index.js — GitBot V4 (Multi-Tenant)
 // ─────────────────────────────────────────────────────────────────────────────
-// What's new in V3 (Multi-Repository Support):
-//   - SQLite database for storing multiple repositories
-//   - /repo add/remove/list/info/enable - manage multiple repos
-//   - /admin add/remove/list - manage bot administrators
-//   - Per-repo webhook routing (/webhook/:repoId or /webhook/owner/repo)
-//   - Auto-generated webhook secrets per repository
-//   - Legacy mode still supported for config.json
+// V4 changes:
+//   - Supabase PostgreSQL for multi-tenant data storage
+//   - Global slash commands (works in all guilds)
+//   - Per-guild workspace isolation
+//   - Auto-detect local IP for webhook URL display
+//   - Removed legacy config.json support
 // ─────────────────────────────────────────────────────────────────────────────
 
 "use strict";
 require("dotenv").config();
 
+const os = require("os");
 const {
   Client,
   GatewayIntentBits,
@@ -30,12 +30,11 @@ const {
 const express = require("express");
 
 // Database and modules
-const db        = require("./database");
-const { buildEmbed } = require("./embeds");
+const db = require("./database");
 const { helpCommand, handleHelpInteraction } = require("./help");
-const digest   = require("./digest");
-const mutes    = require("./mutes");
-const poller   = require("./poller");
+const digest = require("./digest");
+const mutes = require("./mutes");
+const poller = require("./poller");
 const {
   repoCommands,
   handleRepoCommand,
@@ -51,59 +50,43 @@ const {
 
 // ─── Startup validation ───────────────────────────────────────────────────────
 
-const REQUIRED_ENV = ["DISCORD_TOKEN", "DISCORD_GUILD_ID"];
-const missingEnv   = REQUIRED_ENV.filter(k => !process.env[k]);
+const REQUIRED_ENV = ["DISCORD_TOKEN", "SUPABASE_URL", "SUPABASE_KEY"];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missingEnv.length) {
   console.error(`❌ Missing environment variables: ${missingEnv.join(", ")}`);
   console.error("   Copy .env.example to .env and fill in your values.");
   process.exit(1);
 }
 
-// ─── Config (Legacy - kept for compatibility) ───────────────────────────────────
+// ─── Local IP detection ──────────────────────────────────────────────────────
 
-function loadConfig() {
-  return { channels: {} };
-}
-
-function saveConfig() {
-  // No-op - config.json is deprecated
+function getLocalIP() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === "IPv4" && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return "127.0.0.1";
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
+// Shared with multiWebhook.js so /status and /events reflect real webhook traffic.
 
-const stats = {
-  eventsReceived: 0,
-  eventsSent:     0,
-  eventsDropped:  0,
-  eventsIgnored:  0,
-  eventsMuted:    0,
-  startTime:      Date.now(),
-  lastEvent:      null,
-  lastEventTime:  null,
-  eventCounts:    {},
-};
-
-function recordEvent(eventType, outcome) {
-  stats.eventsReceived++;
-  stats.lastEvent     = eventType;
-  stats.lastEventTime = new Date();
-  stats.eventCounts[eventType] = (stats.eventCounts[eventType] || 0) + 1;
-  if      (outcome === "sent")    stats.eventsSent++;
-  else if (outcome === "dropped") stats.eventsDropped++;
-  else if (outcome === "muted")   stats.eventsMuted++;
-  else                            stats.eventsIgnored++;
-}
+const stats = webhookStats;
 
 function resetStats() {
   stats.eventsReceived = 0;
-  stats.eventsSent     = 0;
-  stats.eventsDropped  = 0;
-  stats.eventsIgnored  = 0;
-  stats.eventsMuted    = 0;
-  stats.startTime      = Date.now();
-  stats.lastEvent      = null;
-  stats.lastEventTime  = null;
-  stats.eventCounts    = {};
+  stats.eventsSent = 0;
+  stats.eventsDropped = 0;
+  stats.eventsIgnored = 0;
+  stats.eventsMuted = 0;
+  stats.startTime = Date.now();
+  stats.lastEvent = null;
+  stats.lastEventTime = null;
+  stats.eventCounts = {};
 }
 
 // ─── Discord client ───────────────────────────────────────────────────────────
@@ -114,9 +97,9 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 function buildStatusEmbed() {
   const sec = Math.floor((Date.now() - stats.startTime) / 1000);
-  const h   = Math.floor(sec / 3600);
-  const m   = Math.floor((sec % 3600) / 60);
-  const s   = sec % 60;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
 
   const activeMutes = mutes.list();
   const muteStr = activeMutes.length
@@ -128,19 +111,19 @@ function buildStatusEmbed() {
 
   return new EmbedBuilder()
     .setColor(0x5865F2)
-    .setTitle("🤖 GitBot V3 — Status")
+    .setTitle("🤖 GitBot V4 — Status")
     .setThumbnail(client.user.displayAvatarURL())
     .addFields(
-      { name: "🟢 Bot",          value: `**${client.user.tag}**`,               inline: false },
-      { name: "⏱️ Uptime",       value: `${h}h ${m}m ${s}s`,                   inline: true  },
-      { name: "📡 WS Ping",      value: `${client.ws.ping}ms`,                  inline: true  },
-      { name: "📦 Port",         value: String(process.env.WEBHOOK_PORT || 3000), inline: true },
-      { name: "📬 Received",     value: String(stats.eventsReceived),            inline: true  },
-      { name: "✉️ Sent",         value: String(stats.eventsSent),               inline: true  },
-      { name: "🔇 Muted",        value: String(stats.eventsMuted),              inline: true  },
-      { name: "🚫 Dropped",      value: String(stats.eventsDropped),            inline: true  },
-      { name: "⏭️ Ignored",      value: String(stats.eventsIgnored),            inline: true  },
-      { name: "🔕 Active mutes", value: muteStr,                                inline: false },
+      { name: "🟢 Bot", value: `**${client.user.tag}**`, inline: false },
+      { name: "⏱️ Uptime", value: `${h}h ${m}m ${s}s`, inline: true },
+      { name: "📡 WS Ping", value: `${client.ws.ping}ms`, inline: true },
+      { name: "📦 Port", value: String(process.env.WEBHOOK_PORT || 3000), inline: true },
+      { name: "📬 Received", value: String(stats.eventsReceived), inline: true },
+      { name: "✉️ Sent", value: String(stats.eventsSent), inline: true },
+      { name: "🔇 Muted", value: String(stats.eventsMuted), inline: true },
+      { name: "🚫 Dropped", value: String(stats.eventsDropped), inline: true },
+      { name: "⏭️ Ignored", value: String(stats.eventsIgnored), inline: true },
+      { name: "🔕 Active mutes", value: muteStr, inline: false },
     )
     .setFooter({
       text: stats.lastEvent
@@ -156,8 +139,8 @@ function buildEventsEmbed() {
   const rows = Object.entries(stats.eventCounts)
     .sort((a, b) => b[1] - a[1])
     .map(([evt, count]) => {
-      const pct   = Math.round((count / stats.eventsReceived) * 10);
-      const bar   = "█".repeat(pct) + "░".repeat(10 - pct);
+      const pct = Math.round((count / stats.eventsReceived) * 10);
+      const bar = "█".repeat(pct) + "░".repeat(10 - pct);
       const muted = mutes.isMuted(evt) ? " 🔇" : "";
       return `\`${evt.padEnd(22)}\` **${count}** \`${bar}\`${muted}`;
     })
@@ -198,7 +181,6 @@ function rowRefreshDismiss(refreshId, dismissId = "dismiss") {
   );
 }
 
-// Shows a brief ✅ Refreshed state; buttons auto-revert to Refresh/Dismiss
 function rowRefreshedDismiss(dismissId = "dismiss") {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -214,19 +196,19 @@ function rowRefreshedDismiss(dismissId = "dismiss") {
 // ─── Command definitions ──────────────────────────────────────────────────────
 
 const EVENT_CHOICES = [
-  { name: "push",                value: "push"                },
-  { name: "pull_request",        value: "pull_request"        },
-  { name: "issues",              value: "issues"              },
-  { name: "issue_comment",       value: "issue_comment"       },
+  { name: "push", value: "push" },
+  { name: "pull_request", value: "pull_request" },
+  { name: "issues", value: "issues" },
+  { name: "issue_comment", value: "issue_comment" },
   { name: "pull_request_review", value: "pull_request_review" },
-  { name: "release",             value: "release"             },
-  { name: "workflow_run",        value: "workflow_run"        },
-  { name: "star",                value: "star"                },
-  { name: "fork",                value: "fork"                },
-  { name: "create",              value: "create"              },
-  { name: "delete",              value: "delete"              },
-  { name: "check_run",           value: "check_run"           },
-  { name: "deployment_status",   value: "deployment_status"   },
+  { name: "release", value: "release" },
+  { name: "workflow_run", value: "workflow_run" },
+  { name: "star", value: "star" },
+  { name: "fork", value: "fork" },
+  { name: "create", value: "create" },
+  { name: "delete", value: "delete" },
+  { name: "check_run", value: "check_run" },
+  { name: "deployment_status", value: "deployment_status" },
 ];
 
 const slashCommands = [
@@ -296,18 +278,13 @@ const allCommands = [...slashCommands, ...repoCommands.map(c => c.toJSON()), hel
 
 // ─── Initialize Database ───────────────────────────────────────────────────────
 
-// Initialize database before starting
-try {
-  db.init();
-  console.log("[db] Database initialized");
-} catch (err) {
-  console.error("[db] Failed to initialize:", err.message);
-}
+db.init();
+console.log("[db] Database initialized");
 
 // ─── GitHub Poller ────────────────────────────────────────────────────────────
 
 const githubPoller = new poller.GitHubPoller({
-  interval: 60000, // Poll every minute
+  interval: 60000,
   onEvent: (eventType, payload, repo) => {
     handlePolledEvent(eventType, payload, repo, client);
   },
@@ -318,12 +295,12 @@ const githubPoller = new poller.GitHubPoller({
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   try {
-    console.log("⏳ Registering commands…");
+    console.log("⏳ Registering commands globally...");
     await rest.put(
-      Routes.applicationGuildCommands(client.user.id, process.env.DISCORD_GUILD_ID),
+      Routes.applicationCommands(client.user.id),
       { body: allCommands }
     );
-    console.log(`✅ Registered ${allCommands.length} commands.`);
+    console.log(`✅ Registered ${allCommands.length} commands globally.`);
   } catch (err) {
     console.error("❌ Failed to register:", err.message);
   }
@@ -332,8 +309,8 @@ async function registerCommands() {
 // ─── Presence rotation ────────────────────────────────────────────────────────
 
 const presenceMessages = [
-  () => ({ name: "GitHub webhooks · V3",              type: ActivityType.Watching }),
-  () => ({ name: `${stats.eventsReceived} events`,    type: ActivityType.Playing  }),
+  () => ({ name: "GitHub webhooks · V4", type: ActivityType.Watching }),
+  () => ({ name: `${stats.eventsReceived} events`, type: ActivityType.Playing }),
   () => {
     const mins = Math.floor((Date.now() - stats.startTime) / 60_000);
     return { name: `up ${mins}m`, type: ActivityType.Playing };
@@ -354,18 +331,23 @@ function rotatePresence() {
 
 // ─── Channel resolver ─────────────────────────────────────────────────────────
 
-async function getChannel(name) {
-  const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
-  if (!guild) { console.error("[bot] Guild not found"); return null; }
+async function getChannel(guildId, name) {
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) {
+    console.warn(`[bot] Guild ${guildId} not found in cache`);
+    return null;
+  }
 
   let ch = guild.channels.cache.find(c => c.name === name && c.isTextBased());
   if (!ch) {
     try {
       const all = await guild.channels.fetch();
       ch = all.find(c => c?.name === name && c.isTextBased()) || null;
-    } catch (e) { console.error(`[bot] fetch channels: ${e.message}`); }
+    } catch (e) {
+      console.error(`[bot] fetch channels: ${e.message}`);
+    }
   }
-  if (!ch) console.warn(`[bot] Channel "#${name}" not found.`);
+  if (!ch) console.warn(`[bot] Channel "#${name}" not found in guild ${guildId}.`);
   return ch || null;
 }
 
@@ -374,7 +356,6 @@ async function getChannel(name) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 client.on("interactionCreate", async (interaction) => {
-  // Let /help (with its dropdown + pagination) handle itself first
   if (await handleHelpInteraction(interaction)) return;
 
   // ══ Slash commands ══════════════════════════════════════════════════════════
@@ -383,14 +364,13 @@ client.on("interactionCreate", async (interaction) => {
 
     // ── /ping ────────────────────────────────────────────────────────────────
     if (cmd === "ping") {
-      const sent    = await interaction.reply({ content: "🏓 Pinging…", fetchReply: true });
+      const sent = await interaction.reply({ content: "🏓 Pinging…", fetchReply: true });
       const latency = sent.createdTimestamp - interaction.createdTimestamp;
-      const ws      = client.ws.ping;
+      const ws = client.ws.ping;
 
-      // Colour-coded 10-block bar
       const bar = (ms) => {
         const blocks = Math.min(10, Math.max(1, Math.round(ms / 20)));
-        const color  = ms < 80 ? "🟩" : ms < 200 ? "🟨" : "🟥";
+        const color = ms < 80 ? "🟩" : ms < 200 ? "🟨" : "🟥";
         return color.repeat(blocks) + "⬛".repeat(10 - blocks);
       };
 
@@ -399,13 +379,13 @@ client.on("interactionCreate", async (interaction) => {
         .setTitle("🏓 Pong!")
         .addFields(
           { name: "Round-trip", value: `${bar(latency)}\n**${latency}ms**`, inline: true },
-          { name: "WebSocket",  value: `${bar(ws)}\n**${ws}ms**`,           inline: true },
+          { name: "WebSocket", value: `${bar(ws)}\n**${ws}ms**`, inline: true },
         )
         .setTimestamp();
 
       await interaction.editReply({
-        content:    "",
-        embeds:     [embed],
+        content: "",
+        embeds: [embed],
         components: [rowDismiss("ping:dismiss")],
       });
       return;
@@ -414,7 +394,7 @@ client.on("interactionCreate", async (interaction) => {
     // ── /status ──────────────────────────────────────────────────────────────
     if (cmd === "status") {
       await interaction.reply({
-        embeds:     [buildStatusEmbed()],
+        embeds: [buildStatusEmbed()],
         components: [rowRefreshDismiss("status:refresh", "status:dismiss")],
       });
       return;
@@ -427,7 +407,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "📭 No events received yet since bot started.", ephemeral: true });
       }
       await interaction.reply({
-        embeds:     [embed],
+        embeds: [embed],
         components: [rowRefreshDismiss("events:refresh", "events:dismiss")],
       });
       return;
@@ -437,9 +417,8 @@ client.on("interactionCreate", async (interaction) => {
     if (cmd === "test") {
       let chName = (interaction.options.getString("channel") || "").replace(/^#/, "");
       if (!chName) {
-        // Default to the first active repo's channel, or a fallback name
-        const repos  = db.getAllRepositories();
-        const first  = repos.find(r => r.channel_id);
+        const repos = await db.getAllRepositories(interaction.guildId);
+        const first = repos.find(r => r.channel_id);
         if (first) {
           const ch = client.channels.cache.get(first.channel_id);
           chName = ch?.name || "github-general";
@@ -448,7 +427,7 @@ client.on("interactionCreate", async (interaction) => {
         }
       }
 
-      const ch = await getChannel(chName);
+      const ch = await getChannel(interaction.guildId, chName);
       if (!ch) {
         return interaction.reply({
           content: `❌ Channel **#${chName}** not found. Make sure it exists and I have access.`,
@@ -456,25 +435,26 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
+      const localIP = getLocalIP();
       const port = process.env.WEBHOOK_PORT || 3000;
+      const baseUrl = process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`;
 
       const testEmbed = new EmbedBuilder()
         .setColor(0x5865F2)
-        .setAuthor({ name: "GitBot V3", iconURL: client.user.displayAvatarURL() })
+        .setAuthor({ name: "GitBot V4", iconURL: client.user.displayAvatarURL() })
         .setTitle("🧪 Test Notification")
         .setDescription(
           "If you can see this, GitBot can post to this channel.\n\n" +
           "Use the buttons below to confirm or resend the test."
         )
         .addFields(
-          { name: "Webhook URL",  value: `\`http://YOUR_IP:${port}/webhook\``, inline: false },
-          { name: "Health Check", value: `\`http://YOUR_IP:${port}/health\``,  inline: false },
-          { name: "Channel",      value: `<#${ch.id}>`,                         inline: true  },
-          { name: "Tested by",    value: `<@${interaction.user.id}>`,           inline: true  },
+          { name: "Webhook URL", value: `\`${baseUrl}/webhook\``, inline: false },
+          { name: "Health Check", value: `\`${baseUrl}/health\``, inline: false },
+          { name: "Channel", value: `<#${ch.id}>`, inline: true },
+          { name: "Tested by", value: `<@${interaction.user.id}>`, inline: true },
         )
         .setTimestamp();
 
-      // ✅ Looks good! deletes the embed. 🔁 Resend sends a fresh copy.
       const testRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(`test:ok:${ch.id}`)
@@ -500,12 +480,11 @@ client.on("interactionCreate", async (interaction) => {
     // ── /mute ────────────────────────────────────────────────────────────────
     if (cmd === "mute") {
       const eventArg = interaction.options.getString("event");
-      const reason   = interaction.options.getString("reason") || "";
+      const reason = interaction.options.getString("reason") || "";
 
-      // Already muted? Show current state + Unmute button
       const existing = mutes.getMute(eventArg);
       if (existing) {
-        const left    = Math.ceil((existing.expiresAt.getTime() - Date.now()) / 60_000);
+        const left = Math.ceil((existing.expiresAt.getTime() - Date.now()) / 60_000);
         const expires = `<t:${Math.floor(existing.expiresAt.getTime() / 1000)}:R>`;
         const unmuteRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
@@ -526,7 +505,6 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // Duration picker
       const muteEmbed = new EmbedBuilder()
         .setColor(0xF39C12)
         .setTitle(`🔇 Mute \`${eventArg}\``)
@@ -579,7 +557,7 @@ client.on("interactionCreate", async (interaction) => {
             .setDescription("All event types are currently active.")
             .setTimestamp()],
           components: [rowDismiss("watchlist:dismiss")],
-          ephemeral:  true,
+          ephemeral: true,
         });
       }
 
@@ -589,18 +567,17 @@ client.on("interactionCreate", async (interaction) => {
         .setDescription("Click an **Unmute** button to lift a mute early.")
         .addFields(
           activeMutes.map(mu => {
-            const left    = Math.ceil((mu.expiresAt.getTime() - Date.now()) / 60_000);
+            const left = Math.ceil((mu.expiresAt.getTime() - Date.now()) / 60_000);
             const expires = `<t:${Math.floor(mu.expiresAt.getTime() / 1000)}:R>`;
             return {
-              name:   `\`${mu.eventType}\``,
-              value:  `Expires ${expires} (${left}m left)\nBy <@${mu.mutedBy}>${mu.reason ? `\n> ${mu.reason}` : ""}`,
+              name: `\`${mu.eventType}\``,
+              value: `Expires ${expires} (${left}m left)\nBy <@${mu.mutedBy}>${mu.reason ? `\n> ${mu.reason}` : ""}`,
               inline: true,
             };
           })
         )
         .setTimestamp();
 
-      // One Unmute button per muted event (5 per row, max 4 rows + 1 dismiss row)
       const btnRows = [];
       for (const ch of chunks(activeMutes, 5).slice(0, 4)) {
         btnRows.push(new ActionRowBuilder().addComponents(
@@ -621,7 +598,7 @@ client.on("interactionCreate", async (interaction) => {
 
     // ── /digest ───────────────────────────────────────────────────────────────
     if (cmd === "digest") {
-      const count   = interaction.options.getInteger("count") ?? 10;
+      const count = interaction.options.getInteger("count") ?? 10;
       const entries = digest.recent(count);
       await interaction.reply(buildDigestPayload(entries, count));
       return;
@@ -680,34 +657,32 @@ client.on("interactionCreate", async (interaction) => {
 
   // ══ Context menus ════════════════════════════════════════════════════════════
   else if (interaction.isMessageContextMenuCommand()) {
-    const cmd     = interaction.commandName;
+    const cmd = interaction.commandName;
     const message = interaction.targetMessage;
 
     // ── "📌 Pin to GitHub log" ──────────────────────────────────────────────
     if (cmd === "📌 Pin to GitHub log") {
-      const cfg        = loadConfig();
-      const logChName  = cfg.log_channel || "github-log";
-      const logChannel = await getChannel(logChName);
+      const logChName = "github-log";
+      const logChannel = await getChannel(interaction.guildId, logChName);
 
       if (!logChannel) {
         return interaction.reply({
-          content: `❌ Log channel **#${logChName}** not found.\nAdd \`"log_channel": "channel-name"\` to \`config.json\`.`,
+          content: `❌ Log channel **#${logChName}** not found.`,
           ephemeral: true,
         });
       }
 
-      // Build a pin-frame embed, then optionally include the original embed
       const pinEmbed = new EmbedBuilder()
         .setColor(0x5865F2)
         .setAuthor({
-          name:    `📌 Pinned by ${interaction.user.username}`,
+          name: `📌 Pinned by ${interaction.user.username}`,
           iconURL: interaction.user.displayAvatarURL(),
         })
         .setDescription(message.content || "_No text content_")
         .addFields(
-          { name: "Source",  value: `<#${message.channelId}>`,    inline: true },
-          { name: "Author",  value: message.author ? `<@${message.author.id}>` : "_unknown_", inline: true },
-          { name: "Jump",    value: `[View original](${message.url})`,          inline: true },
+          { name: "Source", value: `<#${message.channelId}>`, inline: true },
+          { name: "Author", value: message.author ? `<@${message.author.id}>` : "_unknown_", inline: true },
+          { name: "Jump", value: `[View original](${message.url})`, inline: true },
         )
         .setTimestamp(message.createdAt);
 
@@ -715,7 +690,6 @@ client.on("interactionCreate", async (interaction) => {
         ? [pinEmbed, EmbedBuilder.from(message.embeds[0])]
         : [pinEmbed];
 
-      // Pin message has an "Acknowledged" button to mark it as reviewed
       const ackRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(`pin:ack:${interaction.user.id}`)
@@ -741,9 +715,8 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "❌ That message has no embeds.", ephemeral: true });
       }
 
-      // Build the channel list from active repos (V3 — DB-driven)
-      const repos    = db.getAllRepositories();
-      const chNames  = [...new Set(
+      const repos = await db.getAllRepositories(interaction.guildId);
+      const chNames = [...new Set(
         repos
           .map(r => client.channels.cache.get(r.channel_id)?.name)
           .filter(Boolean)
@@ -759,7 +732,6 @@ client.on("interactionCreate", async (interaction) => {
         .setDescription("Choose which channel to resend this embed to:")
         .setFooter({ text: "Shows channels for currently monitored repositories" });
 
-      // Up to 4 channel buttons + cancel
       const pickerRow = new ActionRowBuilder().addComponents(
         ...chNames.slice(0, 4).map(ch =>
           new ButtonBuilder()
@@ -783,18 +755,16 @@ client.on("interactionCreate", async (interaction) => {
   else if (interaction.isButton()) {
     const id = interaction.customId;
 
-    // ── Handle repo interactions (from /repo info) ─────────────────────────────
     if (id.startsWith("repo:")) {
       if (await handleRepoInteraction(interaction)) return;
     }
 
-    // ── Generic / named dismissals ────────────────────────────────────────────
     if (
-      id === "dismiss"           ||
-      id.endsWith(":dismiss")    ||
-      id === "ping:dismiss"      ||
-      id === "mute:cancel"       ||
-      id === "resend:cancel"     ||
+      id === "dismiss" ||
+      id.endsWith(":dismiss") ||
+      id === "ping:dismiss" ||
+      id === "mute:cancel" ||
+      id === "resend:cancel" ||
       id === "clearstats:cancel"
     ) {
       try { await interaction.message.delete(); } catch { /* already gone */ }
@@ -802,10 +772,9 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // ── Status: Refresh ───────────────────────────────────────────────────────
     if (id === "status:refresh") {
       await interaction.update({
-        embeds:     [buildStatusEmbed()],
+        embeds: [buildStatusEmbed()],
         components: [rowRefreshedDismiss("status:dismiss")],
       });
       setTimeout(async () => {
@@ -818,7 +787,6 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // ── Events: Refresh ───────────────────────────────────────────────────────
     if (id === "events:refresh") {
       const embed = buildEventsEmbed();
       if (!embed) {
@@ -826,7 +794,7 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
       await interaction.update({
-        embeds:     [embed],
+        embeds: [embed],
         components: [rowRefreshedDismiss("events:dismiss")],
       });
       setTimeout(async () => {
@@ -839,14 +807,12 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // ── Test embed: Looks good! ────────────────────────────────────────────────
     if (id.startsWith("test:ok:")) {
       try { await interaction.message.delete(); } catch { /* gone */ }
       await interaction.deferUpdate().catch(() => {});
       return;
     }
 
-    // ── Test embed: Resend ────────────────────────────────────────────────────
     if (id.startsWith("test:resend:")) {
       const [, , channelId, chName] = id.split(":");
       const ch = client.channels.cache.get(channelId);
@@ -854,15 +820,18 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "❌ Channel no longer found.", ephemeral: true });
       }
 
+      const localIP = getLocalIP();
       const port = process.env.WEBHOOK_PORT || 3000;
+      const baseUrl = process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`;
+
       const resendEmbed = new EmbedBuilder()
         .setColor(0x5865F2)
-        .setAuthor({ name: "GitBot V3", iconURL: client.user.displayAvatarURL() })
+        .setAuthor({ name: "GitBot V4", iconURL: client.user.displayAvatarURL() })
         .setTitle("🧪 Test Notification (Resent)")
         .setDescription("Test embed resent on request.")
         .addFields(
-          { name: "Webhook URL", value: `\`http://YOUR_IP:${port}/webhook\``, inline: false },
-          { name: "Resent by",   value: `<@${interaction.user.id}>`,          inline: true  },
+          { name: "Webhook URL", value: `\`${baseUrl}/webhook\``, inline: false },
+          { name: "Resent by", value: `<@${interaction.user.id}>`, inline: true },
         )
         .setTimestamp();
 
@@ -884,18 +853,16 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // ── Mute: Apply duration ──────────────────────────────────────────────────
     if (id.startsWith("mute:apply:")) {
-      // mute:apply:<eventType>:<durationMs>:<safeReason>
-      const parts      = id.split(":");
-      const eventType  = parts[2];
+      const parts = id.split(":");
+      const eventType = parts[2];
       const durationMs = parseInt(parts[3], 10);
-      const reason     = parts[4] ? decodeURIComponent(parts[4]) : "";
+      const reason = parts[4] ? decodeURIComponent(parts[4]) : "";
 
       mutes.mute(eventType, durationMs, interaction.user.id, reason);
 
-      const mins    = Math.round(durationMs / 60_000);
-      const label   = mins < 60 ? `${mins}m` : `${Math.round(mins / 60)}h`;
+      const mins = Math.round(durationMs / 60_000);
+      const label = mins < 60 ? `${mins}m` : `${Math.round(mins / 60)}h`;
       const expires = `<t:${Math.floor((Date.now() + durationMs) / 1000)}:R>`;
 
       const muteSuccessEmbed = new EmbedBuilder()
@@ -926,10 +893,9 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // ── Mute: Unmute ──────────────────────────────────────────────────────────
     if (id.startsWith("mute:unmute:")) {
       const eventType = id.slice("mute:unmute:".length);
-      const removed   = mutes.unmute(eventType);
+      const removed = mutes.unmute(eventType);
 
       const embed = new EmbedBuilder()
         .setColor(0x2ECC71)
@@ -945,23 +911,20 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // ── Digest: Load more ─────────────────────────────────────────────────────
     if (id.startsWith("digest:more:")) {
-      const current  = parseInt(id.split(":")[2], 10);
+      const current = parseInt(id.split(":")[2], 10);
       const newCount = Math.min(current + 10, 50);
-      const entries  = digest.recent(newCount);
+      const entries = digest.recent(newCount);
       await interaction.update(buildDigestPayload(entries, newCount));
       return;
     }
 
-    // ── Digest: Dismiss ────────────────────────────────────────────────────────
     if (id === "digest:dismiss") {
       try { await interaction.message.delete(); } catch { /* gone */ }
       await interaction.deferUpdate().catch(() => {});
       return;
     }
 
-    // ── Clear-stats: Confirm ──────────────────────────────────────────────────
     if (id === "clearstats:confirm") {
       resetStats();
       const embed = new EmbedBuilder()
@@ -977,7 +940,6 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // ── Pin: Acknowledge ──────────────────────────────────────────────────────
     if (id.startsWith("pin:ack:")) {
       await interaction.update({
         components: [new ActionRowBuilder().addComponents(
@@ -992,19 +954,17 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // ── Resend: Channel selected ──────────────────────────────────────────────
     if (id.startsWith("resend:") && id !== "resend:cancel") {
       const [, msgId, chName] = id.split(":");
 
-      const targetCh = await getChannel(chName);
+      const targetCh = await getChannel(interaction.guildId, chName);
       if (!targetCh) {
         return interaction.reply({ content: `❌ Channel **#${chName}** not found.`, ephemeral: true });
       }
 
-      // Find the original message across all text channels
       let originalMsg = null;
       try {
-        const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
+        const guild = client.guilds.cache.get(interaction.guildId);
         for (const ch of guild.channels.cache.values()) {
           if (!ch.isTextBased()) continue;
           try { originalMsg = await ch.messages.fetch(msgId); break; } catch { /* wrong channel */ }
@@ -1025,8 +985,8 @@ client.on("interactionCreate", async (interaction) => {
       });
 
       await interaction.update({
-        content:    `✅ Resent to **#${chName}**`,
-        embeds:     [],
+        content: `✅ Resent to **#${chName}**`,
+        embeds: [],
         components: [],
       });
       return;
@@ -1041,14 +1001,14 @@ function buildDigestPayload(entries, currentCount) {
 
   if (entries.length === 0) {
     return {
-      content:    "📭 No events in the digest yet. Events appear here once GitHub starts sending webhooks.",
-      embeds:     [],
+      content: "📭 No events in the digest yet. Events appear here once GitHub starts sending webhooks.",
+      embeds: [],
       components: [rowDismiss("digest:dismiss")],
     };
   }
 
   const lines = [...entries].reverse().map(e => {
-    const ts   = `<t:${Math.floor(e.timestamp.getTime() / 1000)}:R>`;
+    const ts = `<t:${Math.floor(e.timestamp.getTime() / 1000)}:R>`;
     const link = e.url ? ` — [↗](${e.url})` : "";
     const icon = e.outcome === "sent" ? "✅" : e.outcome === "muted" ? "🔇" : "⏭️";
     return `${icon} ${ts} ${e.summary}${link}`;
@@ -1085,8 +1045,6 @@ function buildDigestPayload(entries, currentCount) {
 // ─── Bot ready ────────────────────────────────────────────────────────────────
 
 client.once("ready", async () => {
-  // Resolve the real application owner (the Discord user who owns the bot
-  // application) so they always have admin access regardless of the DB.
   try {
     const app = await client.application.fetch();
     const ownerId = app.owner?.id || app.owner?.ownerId || null;
@@ -1095,26 +1053,70 @@ client.once("ready", async () => {
     console.warn("[bot] Could not fetch application owner:", err.message);
   }
 
-  // Start GitHub API polling for repos that have it enabled
   githubPoller.start();
 
-  console.log(`✅ GitBot V3 logged in as ${client.user.tag}`);
-  const cfg = loadConfig();
-  console.log("\n📋 Channel routing:");
-  Object.entries(cfg.channels).forEach(([evt, ch]) => {
-    console.log(`   ${evt.padEnd(25)} → ${ch ? `#${ch}` : "(disabled)"}`);
-  });
-  const baseUrl = process.env.WEBHOOK_BASE_URL || `http://YOUR_IP:${process.env.WEBHOOK_PORT || 3000}`;
+  const localIP = getLocalIP();
+  const port = process.env.WEBHOOK_PORT || 3000;
+  const baseUrl = process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`;
+
+  console.log(`✅ GitBot V4 logged in as ${client.user.tag}`);
+  console.log(`   Guilds: ${client.guilds.cache.size}`);
   console.log(`\n🔗 Webhook base URL: ${baseUrl}`);
   console.log(`   Health check:      ${baseUrl}/health\n`);
 
   client.user.setPresence({
-    status:     "online",
-    activities: [{ name: "GitHub webhooks · V3", type: ActivityType.Watching }],
+    status: "online",
+    activities: [{ name: "GitHub webhooks · V4", type: ActivityType.Watching }],
   });
 
   setInterval(rotatePresence, 30_000);
   await registerCommands();
+});
+
+// ─── Guild join handler ──────────────────────────────────────────────────────
+
+client.on("guildCreate", async (guild) => {
+  try {
+    await db.ensureGuild(guild.id, guild.name, guild.ownerId);
+    console.log(`[bot] Joined guild: ${guild.name} (${guild.id})`);
+
+    // Send welcome message to system channel
+    const systemChannel = guild.systemChannel;
+    if (systemChannel) {
+      const localIP = getLocalIP();
+      const port = process.env.WEBHOOK_PORT || 3000;
+      const baseUrl = process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`;
+
+      const welcomeEmbed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle("👋 GitBot V4 — GitHub Notifications")
+        .setDescription(
+          "Thanks for adding GitBot! I'll send GitHub events (pushes, PRs, issues, releases) to your Discord channels.\n\n" +
+          "**Quick start:**\n" +
+          "1. Use `/repo add owner/repo` to add a GitHub repository\n" +
+          "2. I'll create a channel and give you a webhook URL\n" +
+          "3. Add that URL to your GitHub repo's Webhooks settings\n\n" +
+          "**Commands:**\n" +
+          "• `/repo add/remove/list/info/enable` — Manage repositories\n" +
+          "• `/admin add/remove/list` — Manage bot admins\n" +
+          "• `/mute` — Silence specific event types\n" +
+          "• `/status` — View bot statistics"
+        )
+        .addFields(
+          { name: "🔗 Webhook URL", value: `\`${baseUrl}/webhook\``, inline: false },
+          { name: "📖 Help", value: "Use `/help` for detailed guides", inline: false },
+        )
+        .setTimestamp();
+
+      await systemChannel.send({ embeds: [welcomeEmbed] });
+    }
+  } catch (err) {
+    console.error(`[bot] Error handling guildCreate: ${err.message}`);
+  }
+});
+
+client.on("guildDelete", (guild) => {
+  console.log(`[bot] Left guild: ${guild.name} (${guild.id})`);
 });
 
 // ─── Utility ──────────────────────────────────────────────────────────────────
@@ -1128,25 +1130,25 @@ function chunks(arr, size) {
 // ─── Webhook server (Multi-repo) ─────────────────────────────────────────────
 
 const app = express();
-
-// Use the multi-repo webhook router
-const webhookRouter = createWebhookRouter(client, getChannel);
+app.set('trust proxy', 1);
+const webhookRouter = createWebhookRouter(client);
 app.use(webhookRouter);
-
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.WEBHOOK_PORT || "3000", 10);
 
 app.listen(PORT, () => {
+  const localIP = getLocalIP();
   console.log(`🌐 Webhook server on port ${PORT}`);
+  console.log(`📡 Local IP: ${localIP}`);
   client.login(process.env.DISCORD_TOKEN).catch(err => {
     console.error("❌ Discord login failed:", err.message);
     process.exit(1);
   });
 });
 
-process.on("SIGINT",  () => shutdown("SIGINT"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 function shutdown(signal) {

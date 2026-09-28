@@ -1,4 +1,4 @@
-// help.js — /help command with category dropdown + pagination (GitBot V3)
+// help.js — /help command with category dropdown + pagination (GitBot V4)
 
 "use strict";
 
@@ -12,7 +12,7 @@ const {
   ButtonStyle,
 } = require("discord.js");
 
-// ─── Colours ─────────────────────────────────────────────────────────────────
+// ─── Colours ───────────────────────────────────────────────────────────
 
 const C = {
   overview:      0x5865F2,
@@ -28,14 +28,14 @@ const C = {
 const CATEGORIES = {
 
   overview: {
-    label: "📖 Overview", description: "What GitBot V3 is and how it works",
+    label: "📖 Overview", description: "What GitBot V4 is and how it works",
     color: C.overview,
     pages: [{
-      title: "📖 GitBot V3 — Overview",
+      title: "📖 GitBot V4 — Overview",
       description:
-        "GitBot V3 is a self-hosted Discord bot that forwards **GitHub webhook events** to your Discord server as rich embeds.\n\n" +
+        "GitBot V4 is a self-hosted multi-tenant Discord bot that forwards **GitHub webhook events** to your Discord server as rich embeds.\n\n" +
         "Add any number of repositories with `/repo add` — each gets its own channel, auto-generated webhook secret, " +
-        "and a guided DM setup flow for the repo owner. Events are verified, routed, and posted automatically.",
+        "and a guided DM setup flow for the repo owner. Events are verified, routed, and posted automatically via Supabase.",
       fields: [
         {
           name: "📦 Files",
@@ -44,10 +44,11 @@ const CATEGORIES = {
             "`embeds.js`       — GitHub event → Discord embed formatters\n" +
             "`digest.js`       — in-memory ring buffer (last 50 events)\n" +
             "`mutes.js`        — in-memory mute store\n" +
-            "`database.js`     — SQLite multi-repo store\n" +
+            "`database.js`     — Supabase PostgreSQL store\n" +
             "`multiWebhook.js` — per-repo webhook routing\n" +
             "`repoCommands.js` — `/repo` and `/admin` commands\n" +
             "`poller.js`       — GitHub API polling\n" +
+            "`schema.sql`     — Supabase database schema\n" +
             "`.env`            — secrets (never commit!)",
         },
         {
@@ -58,9 +59,9 @@ const CATEGORIES = {
             "payload URL appears immediately in the reply.",
         },
         {
-          name: "🗄️ Multi-repo",
+          name: "🗄️ Multi-tenant",
           value:
-            "Add unlimited repos with `/repo add owner/repo`. " +
+            "Supabase-backed multi-tenant isolation. Add unlimited repos per guild with `/repo add owner/repo`. " +
             "Each gets its own Discord channel and webhook endpoint at `/webhook/:id`.",
         },
       ],
@@ -258,7 +259,7 @@ const CATEGORIES = {
     pages: [
       {
         title: "⚡ Setup Guide — Page 1 / 2",
-        description: "Get GitBot V3 running:",
+        description: "Get GitBot V4 running:",
         fields: [
           {
             name: "1️⃣ Clone & install",
@@ -281,7 +282,7 @@ const CATEGORIES = {
             name: "4️⃣ Configure .env",
             value:
               "```bash\ncp .env.example .env\n```\n" +
-              "Fill in `DISCORD_TOKEN`, `DISCORD_GUILD_ID`, `WEBHOOK_PORT`, and `WEBHOOK_BASE_URL` (your ngrok URL).",
+              "Fill in `DISCORD_TOKEN`, `SUPABASE_URL`, `SUPABASE_KEY`, `WEBHOOK_BASE_URL`, and rate limit vars.",
           },
         ],
       },
@@ -401,8 +402,8 @@ function buildHelpMessage(categoryKey, pageIndex) {
     .setDescription(page.description)
     .setFooter({
       text: total > 1
-        ? `Page ${idx + 1} of ${total}  •  GitBot V3 Help`
-        : "GitBot V3 Help",
+        ? `Page ${idx + 1} of ${total}  •  GitBot V4 Help`
+        : "GitBot V4 Help",
     })
     .setTimestamp();
 
@@ -449,7 +450,7 @@ function buildHelpMessage(categoryKey, pageIndex) {
 
 const helpCommand = new SlashCommandBuilder()
   .setName("help")
-  .setDescription("Browse GitBot V3 documentation — commands, context menus, events, and setup")
+  .setDescription("Browse GitBot V4 documentation — commands, context menus, events, and setup")
   .toJSON();
 
 async function handleHelpInteraction(interaction) {

@@ -26,7 +26,7 @@ const _ring = [];
  * @param {object} payload      Raw webhook payload
  * @param {'sent'|'dropped'|'ignored'} outcome
  */
-function push(eventType, payload, outcome) {
+function push(eventType, payload, outcome, repoName = null) {
   const entry = {
     eventType,
     outcome,
@@ -35,6 +35,7 @@ function push(eventType, payload, outcome) {
     repo:    payload?.repository?.full_name || null,
     summary: _summarise(eventType, payload),
     url:     _url(eventType, payload),
+    repoName,
   };
 
   _ring.push(entry);

@@ -1,29 +1,46 @@
-// repoCommands.js — Repository management slash commands
+// repoCommands.js — Repository management slash commands (multi-tenant)
 // Handles /repo add, /repo remove, /repo list, /repo info, /admin commands
 
 "use strict";
 
+const os = require("os");
 const {
   SlashCommandBuilder,
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  StringSelectMenuBuilder,
-  StringSelectMenuOptionBuilder,
 } = require("discord.js");
 
 const db = require("./database");
 
 // ─── In-memory pending setup tracker ─────────────────────────────────────────
-// Tracks repos waiting for webhook confirmation (adminUserId, targetUserId, dmMessageId)
 /** @type {Map<number, {adminUserId: string, targetUserId: string|null, dmMessageId: string|null}>} */
 const _pendingSetup = new Map();
+
+// ─── Local IP helper ─────────────────────────────────────────────────────────
+
+function getLocalIP() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === "IPv4" && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return "127.0.0.1";
+}
+
+function getBaseUrl() {
+  const localIP = getLocalIP();
+  const port = process.env.WEBHOOK_PORT || 3000;
+  return (process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`).replace(/\/$/, "");
+}
 
 // ─── Command Definitions ────────────────────────────────────────────────────────
 
 const repoCommands = [
-  // /repo add
   new SlashCommandBuilder()
     .setName("repo")
     .setDescription("Manage GitHub repositories")
@@ -37,7 +54,7 @@ const repoCommands = [
         )
         .addStringOption(o =>
           o.setName("channel")
-            .setDescription("Discord channel for notifications (default: current channel)")
+            .setDescription("Discord channel for notifications (default: auto-create)")
             .setRequired(false)
         )
         .addBooleanOption(o =>
@@ -92,8 +109,7 @@ const repoCommands = [
             .setRequired(true)
         )
     ),
-    
-  // /admin commands
+
   new SlashCommandBuilder()
     .setName("admin")
     .setDescription("Bot administration")
@@ -123,9 +139,6 @@ const repoCommands = [
 
 // ─── Helper Functions ─────────────────────────────────────────────────────────
 
-/**
- * Parse repository string (owner/repo)
- */
 function parseRepoString(repoStr) {
   const match = repoStr.trim().match(/^([^\/]+)\/([^\/]+)$/);
   if (!match) {
@@ -134,33 +147,26 @@ function parseRepoString(repoStr) {
   return { owner: match[1], name: match[2] };
 }
 
-/**
- * Get a repository by ID or full name
- */
-function getRepo(identifier) {
+async function getRepo(guildId, identifier) {
   const idOrName = String(identifier);
   if (/^\d+$/.test(idOrName)) {
     return db.getRepositoryById(parseInt(idOrName, 10));
   }
-  return db.getRepositoryByFullName(idOrName);
+  return db.getRepositoryByFullName(guildId, idOrName);
 }
 
 // ─── Command Handlers ───────────────────────────────────────────────────────
 
-/**
- * Handle /repo commands
- */
 async function handleRepoCommand(interaction) {
   const subcommand = interaction.options.getSubcommand();
-  
-  // All repo commands require admin
-  if (!isUserAdmin(interaction)) {
+
+  if (!await isUserAdmin(interaction)) {
     return interaction.reply({
       content: "❌ You need admin permissions to manage repositories.",
       ephemeral: true,
     });
   }
-  
+
   switch (subcommand) {
     case "add":
       return handleRepoAdd(interaction);
@@ -177,14 +183,12 @@ async function handleRepoCommand(interaction) {
   }
 }
 
-/**
- * Handle /repo add
- */
 async function handleRepoAdd(interaction) {
-  const repoStr     = interaction.options.getString("repository");
+  const repoStr = interaction.options.getString("repository");
   const channelName = interaction.options.getString("channel");
-  const usePolling  = interaction.options.getBoolean("polling");
-  const targetUser  = interaction.options.getUser("user");
+  const usePolling = interaction.options.getBoolean("polling");
+  const targetUser = interaction.options.getUser("user");
+  const guildId = interaction.guildId;
 
   await interaction.deferReply();
 
@@ -192,16 +196,15 @@ async function handleRepoAdd(interaction) {
     const { owner, name } = parseRepoString(repoStr);
     const fullName = `${owner}/${name}`;
 
-    // Check if repo already exists
-    const existing = db.getRepositoryByFullName(fullName);
+    const existing = await db.getRepositoryByFullName(guildId, fullName);
     if (existing && existing.is_active) {
       return interaction.editReply({
         content: `❌ Repository **${fullName}** is already registered.`,
       });
     }
 
-    // ── Resolve or create the notification channel ─────────────────────────
-    let channelId          = null;
+    // Resolve or create the notification channel
+    let channelId = null;
     let channelDisplayName = null;
 
     const resolveOrCreate = async (desiredName) => {
@@ -210,8 +213,8 @@ async function handleRepoAdd(interaction) {
       );
       if (!ch) {
         ch = await interaction.guild.channels.create({
-          name:  desiredName,
-          type:  0,
+          name: desiredName,
+          type: 0,
           topic: `GitHub updates for ${fullName}`,
         });
         console.log(`[repo] Created channel #${desiredName} for ${fullName}`);
@@ -224,49 +227,46 @@ async function handleRepoAdd(interaction) {
         ? channelName.replace(/^#/, "").toLowerCase().replace(/\s+/g, "-")
         : `github-${owner.toLowerCase()}-${name.toLowerCase()}`.replace(/[^a-z0-9-]/g, "-").slice(0, 100);
 
-      const ch       = await resolveOrCreate(desiredName);
-      channelId          = ch.id;
+      const ch = await resolveOrCreate(desiredName);
+      channelId = ch.id;
       channelDisplayName = ch.name;
     } catch (err) {
       return interaction.editReply({ content: `❌ Failed to create channel: ${err.message}` });
     }
 
-    // ── Generate secret and register repo ─────────────────────────────────
-    const crypto       = require("crypto");
+    // Generate secret and register repo
+    const crypto = require("crypto");
     const webhookSecret = crypto.randomBytes(32).toString("hex");
 
-    const repo = db.addRepository(owner, name, channelId, interaction.user.id, {
+    const repo = await db.addRepository(guildId, owner, name, channelId, interaction.user.id, {
       webhookSecret,
       pollEnabled: usePolling || false,
     });
 
-    // Store admin user ID on repo so we can notify them on ping confirmation
-    // We piggyback on error_message field — use a dedicated meta key instead
-    // by storing it in a lightweight in-memory map (survives current process)
     _pendingSetup.set(repo.id, {
-      adminUserId:   interaction.user.id,
-      targetUserId:  targetUser?.id || null,
-      dmMessageId:   null, // filled in after DM is sent
+      adminUserId: interaction.user.id,
+      targetUserId: targetUser?.id || null,
+      dmMessageId: null,
     });
 
-    // ── Build webhook URL ──────────────────────────────────────────────────
-    const baseUrl    = (process.env.WEBHOOK_BASE_URL || "").replace(/\/$/, "");
-    const webhookUrl = baseUrl ? `${baseUrl}/webhook/${repo.id}` : `<YOUR_NGROK_URL>/webhook/${repo.id}`;
+    // Build webhook URL
+    const baseUrl = getBaseUrl();
+    const webhookUrl = `${baseUrl}/webhook/${repo.id}`;
 
-    // ── Admin reply (in server) ────────────────────────────────────────────
+    // Admin reply
     const adminEmbed = new EmbedBuilder()
       .setColor(0x2ECC71)
       .setTitle("✅ Repository Added")
       .setDescription(`Now monitoring **[${fullName}](https://github.com/${fullName})**`)
       .addFields(
-        { name: "ID",         value: String(repo.id),        inline: true },
-        { name: "Channel",    value: `<#${channelId}>`,       inline: true },
-        { name: "Method",     value: "🔗 Webhook",            inline: true },
-        { name: "Added by",   value: `<@${interaction.user.id}>`, inline: true },
+        { name: "ID", value: String(repo.id), inline: true },
+        { name: "Channel", value: `<#${channelId}>`, inline: true },
+        { name: "Method", value: usePolling ? "📡 Polling" : "🔗 Webhook", inline: true },
+        { name: "Added by", value: `<@${interaction.user.id}>`, inline: true },
         ...(targetUser ? [{ name: "Repo owner", value: `<@${targetUser.id}>`, inline: true }] : []),
       )
       .addFields(
-        { name: "🔗 Payload URL",   value: `\`${webhookUrl}\``,   inline: false },
+        { name: "🔗 Payload URL", value: `\`${webhookUrl}\``, inline: false },
         { name: "🔑 Webhook Secret", value: `\`${webhookSecret}\``, inline: false },
       )
       .setFooter({ text: targetUser ? `Setup instructions sent to ${targetUser.username} via DM` : "No user specified — share the details above manually" })
@@ -274,7 +274,7 @@ async function handleRepoAdd(interaction) {
 
     await interaction.editReply({ embeds: [adminEmbed] });
 
-    // ── DM the target user ─────────────────────────────────────────────────
+    // DM the target user
     if (targetUser) {
       const dmEmbed = new EmbedBuilder()
         .setColor(0x5865F2)
@@ -332,8 +332,7 @@ async function handleRepoAdd(interaction) {
 
       try {
         const dmChannel = await targetUser.createDM();
-        const dmMsg     = await dmChannel.send({ embeds: [dmEmbed], components: [confirmRow] });
-        // Store DM message ID so we can delete it on confirmation
+        const dmMsg = await dmChannel.send({ embeds: [dmEmbed], components: [confirmRow] });
         const pending = _pendingSetup.get(repo.id);
         if (pending) pending.dmMessageId = dmMsg.id;
         console.log(`[repo] DM sent to ${targetUser.username} for ${fullName}`);
@@ -352,24 +351,20 @@ async function handleRepoAdd(interaction) {
   }
 }
 
-/**
- * Handle /repo remove
- */
 async function handleRepoRemove(interaction) {
   const identifier = interaction.options.getString("repository");
-  
-  try {
-    const repo = getRepo(identifier);
-    if (!repo) {
-      return interaction.reply({
-        content: "❌ Repository not found.",
-        ephemeral: true,
-      });
-    }
-    
-    // Hard delete (permanent removal so it can be re-added)
-    db.deleteRepository(repo.id);
-    
+
+    try {
+      const repo = await getRepo(interaction.guildId, identifier);
+      if (!repo) {
+        return interaction.reply({
+          content: "❌ Repository not found.",
+          ephemeral: true,
+        });
+      }
+
+      await db.deleteRepository(repo.id, interaction.guildId);
+
     const embed = new EmbedBuilder()
       .setColor(0xE74C3C)
       .setTitle("✅ Repository Removed")
@@ -378,9 +373,9 @@ async function handleRepoRemove(interaction) {
         { name: "ID", value: String(repo.id), inline: true },
       )
       .setTimestamp();
-    
+
     return interaction.reply({ embeds: [embed] });
-    
+
   } catch (err) {
     console.error("[repo] Remove error:", err);
     return interaction.reply({
@@ -390,33 +385,28 @@ async function handleRepoRemove(interaction) {
   }
 }
 
-/**
- * Handle /repo list
- */
 async function handleRepoList(interaction) {
   const detailed = interaction.options.getBoolean("detailed");
-  
-  const repos = db.getAllRepositories();
-  
+  const repos = await db.getAllRepositories(interaction.guildId);
+
   if (repos.length === 0) {
     return interaction.reply({
       content: "📭 No repositories are currently being monitored.",
       ephemeral: true,
     });
   }
-  
+
   if (detailed) {
-    // Show detailed list
     const embed = new EmbedBuilder()
       .setColor(0x5865F2)
       .setTitle(`📋 Monitored Repositories (${repos.length})`)
       .setDescription("Detailed view of all registered repositories");
-    
+
     for (const repo of repos) {
-      const status = repo.error_message 
-        ? `⚠️ ${repo.error_message}` 
+      const status = repo.error_message
+        ? `⚠️ ${repo.error_message}`
         : (repo.poll_enabled ? "📡 Polling" : "🔗 Webhook");
-      
+
       embed.addFields({
         name: `${repo.full_name}`,
         value: [
@@ -428,38 +418,34 @@ async function handleRepoList(interaction) {
         inline: false,
       });
     }
-    
+
     return interaction.reply({ embeds: [embed] });
   }
-  
-  // Simple list
+
   const list = repos.map(r => `\`${r.id}\` **${r.full_name}** → <#${r.channel_id}>`).join("\n");
-  
+
   const embed = new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle(`📋 Monitored Repositories (${repos.length})`)
     .setDescription(list)
     .setFooter({ text: "Use /repo list detailed for more info" })
     .setTimestamp();
-  
+
   return interaction.reply({ embeds: [embed] });
 }
 
-/**
- * Handle /repo info
- */
 async function handleRepoInfo(interaction) {
   const identifier = interaction.options.getString("repository");
-  
+
   try {
-    const repo = getRepo(identifier);
+    const repo = await getRepo(interaction.guildId, identifier);
     if (!repo) {
       return interaction.reply({
         content: "❌ Repository not found.",
         ephemeral: true,
       });
     }
-    
+
     const embed = new EmbedBuilder()
       .setColor(0x3498DB)
       .setTitle(`📊 ${repo.full_name}`)
@@ -474,22 +460,21 @@ async function handleRepoInfo(interaction) {
         { name: "Created", value: `<t:${Math.floor(new Date(repo.created_at).getTime() / 1000)}:R>`, inline: true },
         { name: "Created By", value: repo.created_by ? `<@${repo.created_by}>` : "_Unknown_", inline: true },
       );
-    
+
     if (repo.error_message) {
       embed.addFields({
         name: "⚠️ Error",
         value: repo.error_message,
       });
     }
-    
+
     if (repo.poll_enabled && repo.last_commit_sha) {
       embed.addFields({
         name: "Last Commit",
         value: `\`${repo.last_commit_sha.slice(0, 7)}\``,
       });
     }
-    
-    // Add action row with buttons
+
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(`repo:toggle:${repo.id}`)
@@ -500,9 +485,9 @@ async function handleRepoInfo(interaction) {
         .setLabel("Delete")
         .setStyle(ButtonStyle.Danger),
     );
-    
+
     return interaction.reply({ embeds: [embed], components: [row] });
-    
+
   } catch (err) {
     console.error("[repo] Info error:", err);
     return interaction.reply({
@@ -512,28 +497,25 @@ async function handleRepoInfo(interaction) {
   }
 }
 
-/**
- * Handle /repo enable
- */
 async function handleRepoEnable(interaction) {
   const identifier = interaction.options.getString("repository");
   const enable = interaction.options.getBoolean("enable");
-  
+
   try {
-    const repo = getRepo(identifier);
+    const repo = await getRepo(interaction.guildId, identifier);
     if (!repo) {
       return interaction.reply({
         content: "❌ Repository not found.",
         ephemeral: true,
       });
     }
-    
-    db.updateRepository(repo.id, { is_active: enable ? 1 : 0 });
-    
+
+    await db.updateRepository(repo.id, { is_active: enable });
+
     return interaction.reply({
       content: `✅ Repository **${repo.full_name}** has been ${enable ? "enabled" : "disabled"}.`,
     });
-    
+
   } catch (err) {
     console.error("[repo] Enable error:", err);
     return interaction.reply({
@@ -543,20 +525,18 @@ async function handleRepoEnable(interaction) {
   }
 }
 
-/**
- * Handle /admin commands
- */
+// ─── Admin Commands ────────────────────────────────────────────────────────
+
 async function handleAdminCommand(interaction) {
   const subcommand = interaction.options.getSubcommand();
-  
-  // Only existing admins can manage admins (use isUserAdmin to check Discord perms)
-  if (!isUserAdmin(interaction)) {
+
+  if (!await isUserAdmin(interaction)) {
     return interaction.reply({
       content: "❌ You need admin permissions to manage admins.",
       ephemeral: true,
     });
   }
-  
+
   switch (subcommand) {
     case "add":
       return handleAdminAdd(interaction);
@@ -569,23 +549,20 @@ async function handleAdminCommand(interaction) {
   }
 }
 
-/**
- * Handle /admin add
- */
 async function handleAdminAdd(interaction) {
   const user = interaction.options.getUser("user");
-  
+
   try {
-    db.addAdmin(user.id, user.username, interaction.user.id);
-    
+    await db.addAdmin(interaction.guildId, user.id, user.username, interaction.user.id);
+
     const embed = new EmbedBuilder()
       .setColor(0x2ECC71)
       .setTitle("✅ Admin Added")
       .setDescription(`${user.username} (${user.id}) is now an admin.`)
       .setTimestamp();
-    
+
     return interaction.reply({ embeds: [embed] });
-    
+
   } catch (err) {
     console.error("[admin] Add error:", err);
     return interaction.reply({
@@ -595,23 +572,20 @@ async function handleAdminAdd(interaction) {
   }
 }
 
-/**
- * Handle /admin remove
- */
 async function handleAdminRemove(interaction) {
   const user = interaction.options.getUser("user");
-  
+
   try {
-    db.removeAdmin(user.id);
-    
+    await db.removeAdmin(interaction.guildId, user.id);
+
     const embed = new EmbedBuilder()
       .setColor(0xE74C3C)
       .setTitle("✅ Admin Removed")
       .setDescription(`${user.username} is no longer an admin.`)
       .setTimestamp();
-    
+
     return interaction.reply({ embeds: [embed] });
-    
+
   } catch (err) {
     console.error("[admin] Remove error:", err);
     return interaction.reply({
@@ -621,45 +595,41 @@ async function handleAdminRemove(interaction) {
   }
 }
 
-/**
- * Handle /admin list
- */
 async function handleAdminList(interaction) {
-  const admins = db.getAllAdmins();
-  
+  const admins = await db.getAllAdmins(interaction.guildId);
+
   if (admins.length === 0) {
     return interaction.reply({
       content: "📭 No admins configured.",
       ephemeral: true,
     });
   }
-  
+
   const list = admins.map(a => `• **${a.username}** (\`${a.discord_user_id}\`) — added <t:${Math.floor(new Date(a.added_at).getTime() / 1000)}:R>`).join("\n");
-  
+
   const embed = new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle(`👮 Admins (${admins.length})`)
     .setDescription(list)
     .setTimestamp();
-  
+
   return interaction.reply({ embeds: [embed] });
 }
 
-/**
- * Handle all repo-related interactions (buttons, selects)
- */
+// ─── Interaction Handlers (Buttons) ────────────────────────────────────────
+
 async function handleRepoInteraction(interaction) {
-  const parts  = interaction.customId.split(":");
-  const type   = parts[0];
+  const parts = interaction.customId.split(":");
+  const type = parts[0];
   const action = parts[1];
-  const id     = parts[2];
+  const id = parts[2];
 
   if (type !== "repo") return false;
 
-  // ── Webhook confirmed by user ──────────────────────────────────────────────
+  // Webhook confirmed by user
   if (action === "webhook_confirm") {
     const repoId = parseInt(id, 10);
-    const repo   = db.getRepositoryById(repoId);
+    const repo = await db.getRepositoryById(repoId);
 
     if (!repo) {
       await interaction.reply({ content: "❌ Repository not found.", ephemeral: true });
@@ -668,7 +638,6 @@ async function handleRepoInteraction(interaction) {
 
     const pending = _pendingSetup.get(repoId);
 
-    // ── Update the DM: replace embed + button with a simple confirmation ──
     try {
       await interaction.update({
         embeds: [
@@ -687,7 +656,6 @@ async function handleRepoInteraction(interaction) {
       console.warn("[repo] Could not update DM confirmation:", err.message);
     }
 
-    // ── Post confirmation in the repo's channel ────────────────────────────
     try {
       const repoChannel = await interaction.client.channels.fetch(repo.channel_id);
       if (repoChannel) {
@@ -697,7 +665,7 @@ async function handleRepoInteraction(interaction) {
           .setDescription(`**${repo.full_name}** is now connected and ready to receive GitHub events.`)
           .addFields(
             { name: "Confirmed by", value: `<@${interaction.user.id}>`, inline: true },
-            { name: "Repository",   value: `[${repo.full_name}](https://github.com/${repo.full_name})`, inline: true },
+            { name: "Repository", value: `[${repo.full_name}](https://github.com/${repo.full_name})`, inline: true },
           )
           .setTimestamp();
 
@@ -707,11 +675,10 @@ async function handleRepoInteraction(interaction) {
       console.error("[repo] Could not post to repo channel:", err.message);
     }
 
-    // ── Notify the admin ───────────────────────────────────────────────────
     if (pending?.adminUserId) {
       try {
-        const adminUser  = await interaction.client.users.fetch(pending.adminUserId);
-        const adminDM    = await adminUser.createDM();
+        const adminUser = await interaction.client.users.fetch(pending.adminUserId);
+        const adminDM = await adminUser.createDM();
         const adminEmbed = new EmbedBuilder()
           .setColor(0x2ECC71)
           .setTitle("✅ Webhook Confirmed")
@@ -720,7 +687,7 @@ async function handleRepoInteraction(interaction) {
           )
           .addFields(
             { name: "Repository", value: `[${repo.full_name}](https://github.com/${repo.full_name})`, inline: true },
-            { name: "Channel",    value: `<#${repo.channel_id}>`, inline: true },
+            { name: "Channel", value: `<#${repo.channel_id}>`, inline: true },
           )
           .setTimestamp();
 
@@ -730,11 +697,8 @@ async function handleRepoInteraction(interaction) {
       }
     }
 
-    // ── Delete the original DM setup message ──────────────────────────────
     if (pending?.dmMessageId) {
       try {
-        // The interaction.message IS the DM message — delete it after a short delay
-        // so the user sees the updated "✅ Webhook Connected!" for a moment
         setTimeout(async () => {
           try {
             await interaction.message.delete();
@@ -750,16 +714,16 @@ async function handleRepoInteraction(interaction) {
     return true;
   }
 
-  // ── Toggle active state ────────────────────────────────────────────────────
+  // Toggle active state
   if (action === "toggle") {
-    const repo = db.getRepositoryById(parseInt(id, 10));
+    const repo = await db.getRepositoryById(parseInt(id, 10));
     if (!repo) {
       await interaction.reply({ content: "Repository not found", ephemeral: true });
       return true;
     }
 
     const newState = !repo.is_active;
-    db.updateRepository(repo.id, { is_active: newState ? 1 : 0 });
+    await db.updateRepository(repo.id, { is_active: newState });
 
     await interaction.update({
       content: `✅ Repository ${repo.full_name} has been ${newState ? "enabled" : "disabled"}.`,
@@ -768,16 +732,16 @@ async function handleRepoInteraction(interaction) {
     return true;
   }
 
-  // ── Hard delete ────────────────────────────────────────────────────────────
+  // Hard delete
   if (action === "delete") {
-    const repo = db.getRepositoryById(parseInt(id, 10));
+    const repo = await db.getRepositoryById(parseInt(id, 10));
     if (!repo) {
       await interaction.reply({ content: "Repository not found", ephemeral: true });
       return true;
     }
 
     _pendingSetup.delete(repo.id);
-    db.deleteRepository(repo.id);
+    await db.deleteRepository(repo.id);
 
     await interaction.update({
       content: `🗑️ Repository **${repo.full_name}** has been permanently deleted.`,
@@ -789,39 +753,38 @@ async function handleRepoInteraction(interaction) {
   return false;
 }
 
-// Store bot owner ID globally
+// ─── Admin Check ───────────────────────────────────────────────────────────
+
 let BOT_OWNER_ID = null;
 
-/**
- * Set the bot owner ID (call from ready event)
- */
 function setBotOwnerId(ownerId) {
   BOT_OWNER_ID = ownerId;
 }
 
-/**
- * Check if user is admin (with Discord permission check)
- */
-function isUserAdmin(interaction) {
+async function isUserAdmin(interaction) {
   const userId = interaction.user.id;
-  
+
   // Bot owner is always admin
   if (BOT_OWNER_ID && userId === BOT_OWNER_ID) {
     return true;
   }
-  
-  // Database admin check
-  if (db.isAdmin(userId)) {
-    return true;
+
+  // Database admin check (per guild)
+  try {
+    if (await db.isAdmin(interaction.guildId, userId)) {
+      return true;
+    }
+  } catch (err) {
+    console.error("[admin] DB check error:", err.message);
   }
-  
-  // Check if user has admin permissions in Discord
+
+  // Check Discord permissions
   if (interaction.member && interaction.member.permissions) {
     if (interaction.member.permissions.has("Administrator")) {
       return true;
     }
   }
-  
+
   return false;
 }
 

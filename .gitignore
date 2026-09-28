@@ -15,3 +15,15 @@ npm-debug.log*
 
 # Runtime
 .DS_Store
+Thumbs.db
+
+# Binaries — install tools (ngrok, etc) separately
+*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+*.swp
+*.swo

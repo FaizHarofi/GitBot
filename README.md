@@ -1,40 +1,31 @@
-# 🤖 GitBot V3 — Discord GitHub Bot
+# GitBot V4 — Multi-tenant Discord GitHub Bot
 
-A self-hosted Discord bot that forwards GitHub events to your Discord server as rich embeds. Supports **multiple repositories**, per-repo webhook secrets, automatic channel creation, and a guided DM setup flow for repo owners.
+Discord bot self-hosted yang meneruskan event GitHub ke server Discord sebagai rich embeds. Mendukung **multi-repo**, webhook HMAC-SHA256, rate limiting, dan DM setup flow.
 
 ![Node.js](https://img.shields.io/badge/Node.js-18%2B-brightgreen) ![discord.js](https://img.shields.io/badge/discord.js-v14-5865F2) ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ---
 
-## ✨ Features
+## Fitur
 
-- 📦 **Push / commits** — branch, commit list with links and authors
-- 🔀 **Pull requests** — open, merge, close, review requested
-- 🐛 **Issues** — opened, closed, commented, reopened
-- 🚀 **Releases** — new release published
-- ⭐ **Stars & forks** — community activity
-- ✅ **GitHub Actions** — workflow pass/fail notifications
-- 🗄️ **Multi-repo** — monitor unlimited repositories, each with its own channel and secret
-- 🔒 **Per-repo webhook secrets** — auto-generated HMAC-SHA256 secret per repository
-- 📬 **Guided DM setup** — admin tags a repo owner; they receive step-by-step instructions via DM with a confirm button
-- 🏓 **Ping verification** — GitHub's first ping posts a live confirmation embed in the repo's channel
-- 🔇 **Event muting** — silence any event type for 15 min–24 h without disabling it
-- 📋 **Live digest** — scrollable feed of recent events with outcomes
-- 🔄 **Interactive embeds** — refresh, dismiss, undo, and confirm flows throughout
-
----
-
-## 📋 Prerequisites
-
-- [Node.js](https://nodejs.org/) v18 or higher
-- A Discord server where you have admin permissions
-- [ngrok](https://ngrok.com/) (for local development) or a public server
+- **Push / commits** — branch, commit list dengan links dan authors
+- **Pull requests** — open, merge, close, review requested
+- **Issues** — opened, closed, commented, reopened
+- **Releases** — release baru dipublikasikan
+- **Stars & forks** — aktivitas komunitas
+- **GitHub Actions** — workflow pass/fail
+- **Multi-repo** — monitor unlimited repos, masing-masing punya channel sendiri
+- **Per-repo webhook secrets** — HMAC-SHA256 auto-generated per repo
+- **Rate Limiting** — `express-rate-limit` protect webhook dari abuse (tanpa nginx)
+- **Guided DM setup** — admin tag repo owner, mereka terima instruksi via DM
+- **Event muting** — silence event type 15 menit — 24 jam
+- **Live digest** — scrollable feed event terakhir
 
 ---
 
-## ⚡ Setup Guide
+## Cara Menggunakan
 
-### 1. Clone and install
+### 1. Clone & Install
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/discord-github-bot.git
@@ -42,250 +33,294 @@ cd discord-github-bot
 npm install
 ```
 
-### 2. Create your Discord bot
+### 2. Buat Discord Bot
 
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
-2. Click **New Application** → give it a name
-3. Go to **Bot** → click **Add Bot**
-4. Under **Token** → click **Reset Token** and copy it
-5. Enable **Server Members Intent** and **Message Content Intent**
+1. Buka [Discord Developer Portal](https://discord.com/developers/applications)
+2. Klik **New Application** → beri nama
+3. Buka **Bot** → klik **Add Bot**
+4. Di bagian **Token** → klik **Reset Token** dan copy token-nya
+5. Aktifkan **Server Members Intent** dan **Message Content Intent**
 
-### 3. Invite the bot to your server
+### 3. Invite Bot ke Server
 
-1. Go to **OAuth2 → URL Generator**
-2. Check **Scopes:** `bot`
-3. Check **Permissions:** `Send Messages`, `Embed Links`, `View Channels`, `Manage Channels`
-4. Copy the generated URL and open it in your browser
+1. Buka **OAuth2 → URL Generator**
+2. Centang **Scopes:** `bot`
+3. Centang **Permissions:** `Send Messages`, `Embed Links`, `View Channels`, `Manage Channels`
+4. Copy URL yang di-generate, buka di browser
 
-> `Manage Channels` is needed so the bot can auto-create a channel per repository.
+> `Manage Channels` dibutuhkan supaya bot bisa auto-create channel per repo.
 
-### 4. Get your Server ID
-
-1. In Discord go to **Settings → Advanced** and enable **Developer Mode**
-2. Right-click your server icon → **Copy Server ID**
-
-### 5. Configure environment variables
+### 4. Konfigurasi Environment Variables
 
 ```bash
 cp .env.example .env
 ```
 
-| Variable | Description |
-|---|---|
-| `DISCORD_TOKEN` | Discord Developer Portal → Your App → Bot → Token |
-| `DISCORD_GUILD_ID` | Right-click your server → Copy Server ID |
-| `WEBHOOK_PORT` | Port for the Express server (default `3000`) |
-| `WEBHOOK_BASE_URL` | Your public URL — ngrok or permanent domain (see below) |
-| `GITHUB_WEBHOOK_SECRET` | Legacy single-webhook secret (optional, V2 compat) |
-
-### 6. Start ngrok (local development)
-
-```bash
-ngrok http 3000
-```
-
-Copy the `https://xxxx.ngrok-free.app` URL and set it in your `.env`:
+Edit `.env`:
 
 ```
-WEBHOOK_BASE_URL=https://xxxx.ngrok-free.app
+DISCORD_TOKEN=token_bot_discord_kamu
+SUPABASE_URL=https://project-kamu.supabase.co
+SUPABASE_KEY=service_role_key_kamu
+WEBHOOK_PORT=3000
+WEBHOOK_BASE_URL=https://url-publik-kamu
+WEBHOOK_RATE_LIMIT=30
+HEALTH_RATE_LIMIT=60
 ```
 
-> **Tip:** The free ngrok plan gives you a new URL on every restart. Get a [free static domain](https://dashboard.ngrok.com/domains) so your URL never changes:
-> ```bash
-> ngrok http --domain=your-static-domain.ngrok-free.app 3000
-> ```
+| Variable | Default | Deskripsi |
+|---|---|---|
+| `DISCORD_TOKEN` | - | Token dari Discord Developer Portal |
+| `SUPABASE_URL` | - | Supabase project URL (Settings → API) |
+| `SUPABASE_KEY` | - | Supabase service role key |
+| `WEBHOOK_PORT` | `3000` | Port Express server |
+| `WEBHOOK_BASE_URL` | auto IP lokal | URL publik bot kamu (ngrok/Railway/domain) |
+| `WEBHOOK_RATE_LIMIT` | `30` | Max webhook requests per menit per IP |
+| `HEALTH_RATE_LIMIT` | `60` | Max health check requests per menit per IP |
 
-### 7. Start the bot
+> Jalankan `schema.sql` di Supabase SQL Editor sebelum pertama kali start.
+
+### 5. Jalankan Bot
 
 ```bash
 npm start
 ```
 
-You should see:
+Untuk development (auto-reload):
+
+```bash
+npm run dev
 ```
-✅ GitBot V3 logged in as YourBot#1234
+
+Output yang diharapkan:
+
+```
+✅ GitBot V4 logged in as YourBot#1234
 🌐 Webhook server on port 3000
-🔗 Webhook base URL: https://xxxx.ngrok-free.app
+🔗 Webhook base URL: http://YOUR_IP:3000
 ```
 
-### 8. Add your first repository
+### 6. Tambah Repository Pertama
 
-In Discord, run:
+Di Discord, jalankan:
 
 ```
 /repo add repository:owner/repo user:@RepoOwner
 ```
 
-- The bot creates a `#github-owner-repo` channel automatically
-- **You** (admin) get a server reply with the Payload URL and Secret
-- **The repo owner** gets a DM with numbered setup steps and a **"I've added the webhook"** button
+- Bot buat channel `#github-owner-repo` otomatis
+- **Kamu** (admin) terima reply dengan Payload URL dan Secret
+- **Repo owner** terima DM dengan instruksi setup langkah demi langkah
 
-### 9. Repo owner sets up the webhook on GitHub
+### 7. Repo Owner Setup Webhook di GitHub
 
-The DM walks them through:
+DM-nya memandu untuk:
 
-1. Go to the repo → **Settings → Webhooks → Add webhook**
-2. Paste the **Payload URL** (e.g. `https://xxxx.ngrok-free.app/webhook/1`)
-3. Set **Content type** to `application/json`
-4. Paste the **Secret**
-5. Choose events and click **Add webhook**
-6. Click **"I've added the webhook"** in the DM
-
-When GitHub saves the webhook it sends a **ping** — the bot immediately posts a `🏓 GitHub Ping Received` embed in the repo's channel to confirm the connection is live. When the user clicks the button:
-
-- The channel gets a `✅ Webhook Connected` confirmation embed
-- You (admin) receive a DM: *"[username] has added the webhook for owner/repo"*
-- The setup DM is automatically deleted
+1. Buka repo → **Settings → Webhooks → Add webhook**
+2. Paste **Payload URL** (contoh: `https://your-app.up.railway.app/webhook/1`)
+3. Set **Content type** ke `application/json`
+4. Paste **Secret**
+5. Pilih events dan klik **Add webhook**
+6. Klik **"I've added the webhook"** di DM
 
 ---
 
-## 🛠️ Commands
+## Commands
 
-### Repository management
+### Repository Management
 
-| Command | Description |
+| Command | Deskripsi |
 |---|---|
-| `/repo add repository:owner/repo [channel:#name] [user:@user]` | Add a repo to monitor. Creates a channel, generates a secret, and optionally DMs setup instructions to the repo owner. |
-| `/repo remove repository:owner/repo` | Permanently remove a repository |
-| `/repo list [detailed:true]` | List all monitored repositories |
-| `/repo info repository:owner/repo` | Show full details with Enable/Disable and Delete buttons |
-| `/repo enable repository:owner/repo enable:true\|false` | Toggle a repository on or off |
+| `/repo add repository:owner/repo [channel:#name] [user:@user]` | Tambah repo. Buat channel, generate secret, DM setup ke owner |
+| `/repo remove repository:owner/repo` | Hapus repo dari monitoring |
+| `/repo list [detailed:true]` | List semua repo yang di-monitor |
+| `/repo info repository:owner/repo` | Detail lengkap dengan Enable/Disable dan Delete buttons |
+| `/repo enable repository:owner/repo enable:true\|false` | Toggle repo aktif/nonaktif |
 
 ### Admin
 
-| Command | Description |
+| Command | Deskripsi |
 |---|---|
-| `/admin add user:@user` | Grant admin access to a user |
-| `/admin remove user:@user` | Revoke admin access |
-| `/admin list` | List all admins |
+| `/admin add user:@user` | Tambah admin |
+| `/admin remove user:@user` | Hapus admin |
+| `/admin list` | List semua admin |
 
-> Any Discord user with the **Administrator** permission is automatically treated as an admin.
+### Status & Monitoring
 
-### Status and monitoring
-
-| Command | Description |
+| Command | Deskripsi |
 |---|---|
-| `/ping` | Latency check with colour-coded bars |
+| `/ping` | Cek latency dengan color-coded bars |
 | `/status` | Uptime, WS ping, event counters, active mutes |
-| `/events` | Bar chart breakdown of event types since startup |
-| `/digest [count:5–25]` | Scrollable feed of recent GitHub events |
-| `/test [channel:#name]` | Send a test embed to verify bot permissions |
+| `/events` | Breakdown event types sejak bot mulai |
+| `/digest [count:5-25]` | Feed event terakhir |
+| `/test [channel:#name]` | Kirim test embed untuk verifikasi channel |
 
 ### Muting
 
-| Command | Description |
+| Command | Deskripsi |
 |---|---|
-| `/mute event:push [reason:...]` | Silence an event type — duration picker: 15 min / 1 h / 6 h / 24 h |
-| `/watchlist` | View active mutes with one-click Unmute buttons |
+| `/mute event:push [reason:...]` | Silence event type — pilih durasi: 15 min / 1 h / 6 h / 24 h |
+| `/watchlist` | Lihat active mutes dengan Unmute buttons |
 
 ### Other
 
-| Command | Description |
+| Command | Deskripsi |
 |---|---|
-| `/clear-stats` | Reset all event counters (with confirmation) |
-| `/help` | Browse full documentation with category dropdown |
-
-### Context menus (right-click a message → Apps)
-
-| Menu item | Description |
-|---|---|
-| 📌 Pin to GitHub log | Reposts the message to `#github-log` with an Acknowledged button |
-| 🔁 Resend this embed | Re-sends a GitBot embed to any configured channel |
+| `/clear-stats` | Reset semua event counters (dengan konfirmasi) |
+| `/help` | Baca dokumentasi lengkap |
 
 ---
 
-## 📦 Supported Events
+## Rate Limiting
 
-| GitHub Event | What triggers it |
+Project ini menggunakan `express-rate-limit` tanpa nginx:
+
+| Endpoint | Default Limit | Env Variable |
+|---|---|---|
+| `POST /webhook/*` | 30 req/menit per IP | `WEBHOOK_RATE_LIMIT` |
+| `GET /health` | 60 req/menit per IP | `HEALTH_RATE_LIMIT` |
+
+Ketika limit tercapai, response `429 Too Many Requests` dikirim. GitHub otomatis retry.
+
+---
+
+## Supported Events
+
+| GitHub Event | Yang Triggered |
 |---|---|
-| `push` | Commits pushed to any branch |
+| `push` | Commits ke branch apapun |
 | `pull_request` | PR opened, merged, closed, review requested |
 | `issues` | Issue opened, closed, reopened |
-| `issue_comment` | New comment on an issue |
-| `pull_request_review` | PR review submitted |
-| `create` | Branch or tag created |
-| `delete` | Branch or tag deleted |
-| `release` | Release published |
-| `star` | Repo starred or unstarred |
-| `fork` | Repo forked |
-| `workflow_run` | GitHub Actions workflow completed |
-| `check_run` | CI check failed or anomalous (successes are silent) |
+| `issue_comment` | Comment baru di issue |
+| `pull_request_review` | Review PR submitted |
+| `release` | Release dipublikasikan |
+| `workflow_run` | GitHub Actions workflow selesai |
+| `star` | Repo starred/unstarred |
+| `fork` | Repo di-fork |
+| `create` | Branch/tag dibuat |
+| `delete` | Branch/tag dihapus |
+| `check_run` | CI check failed/anomalous |
 | `deployment_status` | Deployment status updated |
-| `ping` | GitHub connectivity test — posts confirmation in repo channel |
+| `ping` | GitHub connectivity test |
 
 ---
 
-## 🚀 Deployment
+## Deploy
 
-### Railway (easiest)
-1. Push this repo to GitHub
-2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
-3. Add your environment variables in the **Variables** tab — set `WEBHOOK_BASE_URL` to the auto-generated Railway URL
-4. Use that same URL when running `/repo add`
+### Railway (Recommended)
 
-### Render (free tier)
-1. Push to GitHub → [render.com](https://render.com) → New Web Service → connect repo
-2. Add environment variables including `WEBHOOK_BASE_URL`
+1. Push repo ke GitHub
+2. Buka [railway.app](https://railway.app) → New Project → Deploy from GitHub
+3. Tambah environment variables di tab **Variables**:
+   - `DISCORD_TOKEN`
+   - `SUPABASE_URL`
+   - `SUPABASE_KEY`
+   - `WEBHOOK_PORT` = `3000`
+   - `WEBHOOK_BASE_URL` = URL Railway (contoh: `https://gitbot.up.railway.app`)
+   - `WEBHOOK_RATE_LIMIT` = `30`
+   - `HEALTH_RATE_LIMIT` = `60`
+4. Set **Health Check** di Settings ke `/health`
+5. Deploy! Bot akan otomatis jalan
 
-> Render's free tier spins down after inactivity (~30 s wake time on first webhook).
+> Tidak perlu volume/disk — semua data disimpan di Supabase.
 
-### VPS (DigitalOcean, Hetzner, etc.)
+### Render (Free Tier)
+
+1. Push ke GitHub → [render.com](https://render.com) → New Web Service → connect repo
+2. Tambah environment variables termasuk `WEBHOOK_BASE_URL`
+3. Free tier sleep setelah inactivity (~30 detik wake time)
+
+### VPS (DigitalOcean, Hetzner, dll)
+
 ```bash
 git clone https://github.com/YOUR_USERNAME/discord-github-bot.git
 cd discord-github-bot
 npm install
-cp .env.example .env && nano .env   # fill in all values including WEBHOOK_BASE_URL
+cp .env.example .env && nano .env   # isi semua values termasuk WEBHOOK_BASE_URL
 
 npm install -g pm2
 pm2 start index.js --name gitbot
 pm2 save && pm2 startup
 ```
 
+### Local (Laragon/XAMPP)
+
+```bash
+npm install
+cp .env.example .env   # isi DISCORD_TOKEN, SUPABASE_URL, SUPABASE_KEY
+npm start
+```
+
+Untuk terima webhook dari GitHub, jalankan ngrok:
+
+```bash
+ngrok http 3000
+```
+
+Copy URL `https://xxxx.ngrok-free.app` → set sebagai `WEBHOOK_BASE_URL` di `.env`.
+
 ---
 
-## 📁 File Structure
+## File Structure
 
 ```
 discord-github-bot/
-├── index.js           # Entry point: Discord client, slash commands, button handlers
-├── multiWebhook.js    # Express webhook router — per-repo routing + ping handler
-├── repoCommands.js    # /repo and /admin slash commands + DM setup flow
-├── embeds.js          # GitHub event → Discord embed formatters
-├── database.js        # SQLite store (repositories, admins, tokens)
-├── poller.js          # GitHub API polling for repos without webhooks
-├── digest.js          # In-memory ring buffer of recent events
-├── mutes.js           # In-memory event mute store
-├── help.js            # /help command with category dropdown + pagination
-├── config.json        # Legacy channel routing (V2 compat, hot-reloaded)
-├── .env               # Your secrets — never commit this!
-├── .env.example       # Template
-├── .gitignore
-└── package.json
+├ index.js           — Entry point: Discord client, slash commands, button handlers
+├ multiWebhook.js    — Express webhook router + rate limiting per-repo
+├ repoCommands.js    — /repo dan /admin slash commands + DM setup flow
+├ embeds.js          — GitHub event → Discord embed formatters
+├ database.js        — Supabase PostgreSQL store (repositories, admins, tokens)
+├ schema.sql         — Skema database Supabase (jalankan di SQL Editor)
+├ poller.js          — GitHub API polling untuk repos tanpa webhooks
+├ digest.js          — In-memory ring buffer event terakhir
+├ mutes.js           — In-memory event mute store
+├ help.js            — /help command dengan category dropdown
+├ .env               — Secrets kamu — jangan commit!
+├ .env.example       — Template
+├ .gitignore
+├ package.json
+└ README.md
 ```
 
 ---
 
-## 🏥 Health Check
+## Health Check
 
 ```
 GET http://localhost:3000/health
 ```
 
-Returns bot status, version, repo count, active mutes, and event stats.
+Response:
+
+```json
+{
+  "status": "ok",
+  "version": "4.0.0",
+  "mode": "multi-tenant",
+  "rateLimit": {
+    "webhookMax": 30,
+    "healthMax": 60
+  },
+  "bot": "connected",
+  "uptime": 3600,
+  "repos": 5,
+  "stats": { ... }
+}
+```
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
-Pull requests are welcome! To add support for a new GitHub event:
+Pull request welcome! Untuk menambah support GitHub event baru:
 
-1. Add a `formatEventName(payload)` function in `embeds.js`
-2. Add a `case` for it in the `buildEmbed()` switch in `embeds.js`
-3. Add it to `EVENT_CHOICES` in `index.js` so it appears in `/mute`
-4. Add it to the supported events table in this README
+1. Tambah `formatEventName(payload)` di `embeds.js`
+2. Tambah `case` di `buildEmbed()` switch di `embeds.js`
+3. Tambah ke `EVENT_CHOICES` di `index.js` supaya muncul di `/mute`
+4. Tambah ke supported events table di README ini
 
 ---
 
-## 📄 License
+## License
 
-MIT — do whatever you want with it.
+MIT — gunakan sesuka hati.
