@@ -1,5 +1,4 @@
 // config.js — environment loading, validation, and shared runtime constants
-// Requiring this module validates the environment and exits on fatal misconfiguration.
 
 "use strict";
 
@@ -17,7 +16,10 @@ if (missingEnv.length) {
   process.exit(1);
 }
 
-// Render/Railway inject PORT — prefer it over WEBHOOK_PORT
+if (!process.env.DASHBOARD_SECRET) {
+  console.warn("⚠️  DASHBOARD_SECRET is not set — the dashboard will be inaccessible until it is.");
+}
+
 const PORT = parseInt(process.env.PORT || process.env.WEBHOOK_PORT || "3000", 10);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -26,9 +28,7 @@ function getLocalIP() {
   const interfaces = os.networkInterfaces();
   for (const name of Object.keys(interfaces)) {
     for (const iface of interfaces[name]) {
-      if (iface.family === "IPv4" && !iface.internal) {
-        return iface.address;
-      }
+      if (iface.family === "IPv4" && !iface.internal) return iface.address;
     }
   }
   return "127.0.0.1";

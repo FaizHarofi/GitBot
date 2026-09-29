@@ -77,13 +77,13 @@ const CATEGORIES = {
         description: "Repository & admin commands:",
         fields: [
           {
-            name: "➕ `/repo add`",
-            value:
-              "Add a GitHub repository to monitor.\n" +
-              "Creates a dedicated channel, generates a webhook secret, and optionally DMs " +
-              "setup instructions to the repo owner with a confirm button.\n" +
-              "Options: `repository` (required), `channel`, `polling`, `user`.",
-          },
+          name: "➕ `/repo add`",
+          value:
+            "Add a GitHub repository to monitor via webhook.\n" +
+            "Creates a dedicated channel, generates a webhook secret, and optionally DMs " +
+            "setup instructions to the repo owner with a confirm button.\n" +
+            "Options: `repository` (required), `channel`, `user`.",
+        },
           {
             name: "📋 `/repo list [detailed]`",
             value: "List all monitored repositories. Add `detailed:true` for channel, status, and timestamps.",

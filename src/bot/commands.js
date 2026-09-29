@@ -9,7 +9,6 @@ const {
 } = require("discord.js");
 
 const { repoCommands } = require("./repoCommands");
-const { tokenCommands } = require("./tokenCommands");
 const { helpCommand } = require("./help");
 
 // ─── Shared choices ───────────────────────────────────────────────────────────
@@ -102,7 +101,6 @@ const contextMenus = [
 const allCommands = [
   ...slashCommands,
   ...repoCommands.map(c => c.toJSON()),
-  ...tokenCommands.map(c => c.toJSON()),
   helpCommand,
   ...contextMenus,
 ];

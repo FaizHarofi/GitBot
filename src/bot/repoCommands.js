@@ -1,5 +1,5 @@
-// repoCommands.js — Repository management slash commands (multi-tenant)
-// Handles /repo add, /repo remove, /repo list, /repo info, /admin commands
+// repoCommands.js — Repository management slash commands (GitBot V5)
+// Handles /repo add, /repo remove, /repo list, /repo info, /repo enable, /admin commands
 
 "use strict";
 
@@ -26,7 +26,7 @@ const repoCommands = [
     .setDescription("Manage GitHub repositories")
     .addSubcommand(sub =>
       sub.setName("add")
-        .setDescription("Add a GitHub repository to monitor")
+        .setDescription("Add a GitHub repository to monitor via webhook")
         .addStringOption(o =>
           o.setName("repository")
             .setDescription("Repository in format 'owner/repo'")
@@ -35,11 +35,6 @@ const repoCommands = [
         .addStringOption(o =>
           o.setName("channel")
             .setDescription("Discord channel for notifications (default: auto-create)")
-            .setRequired(false)
-        )
-        .addBooleanOption(o =>
-          o.setName("polling")
-            .setDescription("Use GitHub API polling instead of webhooks")
             .setRequired(false)
         )
         .addUserOption(o =>
@@ -166,7 +161,6 @@ async function handleRepoCommand(interaction) {
 async function handleRepoAdd(interaction) {
   const repoStr = interaction.options.getString("repository");
   const channelName = interaction.options.getString("channel");
-  const usePolling = interaction.options.getBoolean("polling");
   const targetUser = interaction.options.getUser("user");
   const guildId = interaction.guildId;
 
@@ -214,30 +208,12 @@ async function handleRepoAdd(interaction) {
       return interaction.editReply({ content: `❌ Failed to create channel: ${err.message}` });
     }
 
-    // Polling mode needs a stored GitHub token (see /token add)
-    let tokenId = null;
-    if (usePolling) {
-      const defaultToken = await db.getDefaultToken(guildId);
-      if (!defaultToken) {
-        return interaction.editReply({
-          content:
-            "❌ **Polling mode needs a GitHub token first.**\n\n" +
-            "1. Run `/token add` with a GitHub PAT (Settings → Developer settings → Personal access tokens)\n" +
-            "2. Then run `/repo add` again\n\n" +
-            "_Tip: unless you can't expose a public URL, prefer webhook mode — it's real-time and needs no token._",
-        });
-      }
-      tokenId = defaultToken.id;
-    }
-
     // Generate secret and register repo
     const crypto = require("crypto");
     const webhookSecret = crypto.randomBytes(32).toString("hex");
 
     const repo = await db.addRepository(guildId, owner, name, channelId, interaction.user.id, {
       webhookSecret,
-      tokenId,
-      pollEnabled: usePolling || false,
     });
 
     _pendingSetup.set(repo.id, {
@@ -258,7 +234,7 @@ async function handleRepoAdd(interaction) {
       .addFields(
         { name: "ID", value: String(repo.id), inline: true },
         { name: "Channel", value: `<#${channelId}>`, inline: true },
-        { name: "Method", value: usePolling ? "📡 Polling" : "🔗 Webhook", inline: true },
+        { name: "Method", value: "🔗 Webhook", inline: true },
         { name: "Added by", value: `<@${interaction.user.id}>`, inline: true },
         ...(targetUser ? [{ name: "Repo owner", value: `<@${targetUser.id}>`, inline: true }] : []),
       )
@@ -402,7 +378,7 @@ async function handleRepoList(interaction) {
     for (const repo of repos) {
       const status = repo.error_message
         ? `⚠️ ${repo.error_message}`
-        : (repo.poll_enabled ? "📡 Polling" : "🔗 Webhook");
+        : "🔗 Webhook";
 
       embed.addFields({
         name: `${repo.full_name}`,
@@ -451,9 +427,7 @@ async function handleRepoInfo(interaction) {
         { name: "Owner", value: repo.owner, inline: true },
         { name: "Name", value: repo.name, inline: true },
         { name: "Channel", value: repo.channel_id ? `<#${repo.channel_id}>` : "_None_", inline: true },
-        { name: "Method", value: repo.poll_enabled ? "📡 Polling" : "🔗 Webhook", inline: true },
         { name: "Status", value: repo.is_active ? "✅ Active" : "❌ Inactive", inline: true },
-        { name: "Last Polled", value: repo.last_polled_at ? `<t:${Math.floor(repo.last_polled_at / 1000)}:R>` : "_Never_", inline: true },
         { name: "Created", value: `<t:${Math.floor(new Date(repo.created_at).getTime() / 1000)}:R>`, inline: true },
         { name: "Created By", value: repo.created_by ? `<@${repo.created_by}>` : "_Unknown_", inline: true },
       );
@@ -469,13 +443,6 @@ async function handleRepoInfo(interaction) {
       embed.addFields({
         name: "🔗 Payload URL",
         value: `\`${getBaseUrl()}/webhook/${repo.webhook_token}\``,
-      });
-    }
-
-    if (repo.poll_enabled && repo.last_commit_sha) {
-      embed.addFields({
-        name: "Last Commit",
-        value: `\`${repo.last_commit_sha.slice(0, 7)}\``,
       });
     }
 

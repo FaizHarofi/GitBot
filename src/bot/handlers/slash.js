@@ -22,7 +22,6 @@ const { rowDismiss, rowRefreshDismiss, chunks } = require("../components");
 const { getChannel } = require("../channels");
 const { getBaseUrl } = require("../../config");
 const { handleRepoCommand, handleAdminCommand } = require("../repoCommands");
-const { handleTokenCommand } = require("../tokenCommands");
 
 async function handleSlash(interaction) {
   const cmd = interaction.commandName;
@@ -315,11 +314,6 @@ async function handleSlash(interaction) {
   // ── /admin commands ────────────────────────────────────────────────────────
   if (cmd === "admin") {
     return handleAdminCommand(interaction);
-  }
-
-  // ── /token commands ────────────────────────────────────────────────────────
-  if (cmd === "token") {
-    return handleTokenCommand(interaction);
   }
 }
 

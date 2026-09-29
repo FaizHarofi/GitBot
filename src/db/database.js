@@ -1,5 +1,6 @@
-// database.js — Supabase PostgreSQL database for multi-tenant GitBot
-// Stores guilds, repositories, users, tokens, and settings
+// database.js — Supabase PostgreSQL database for GitBot V5
+// Stores guilds, repositories, admins, event config,
+// notification destinations, event logs, and notification logs.
 
 "use strict";
 
@@ -10,9 +11,6 @@ let supabase;
 
 // ─── Initialization ─────────────────────────────────────────────────────────
 
-/**
- * Initialize Supabase client
- */
 function init() {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_KEY;
@@ -30,16 +28,12 @@ function init() {
   });
 }
 
-/**
- * Generate a random webhook path token (32 hex chars).
- */
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
 function generateWebhookToken() {
   return crypto.randomBytes(16).toString("hex");
 }
 
-/**
- * Ensure every repository has a webhook_token (backfills legacy rows).
- */
 async function backfillWebhookTokens() {
   const { data, error } = await supabase
     .from("repositories")
@@ -57,9 +51,8 @@ async function backfillWebhookTokens() {
   }
 }
 
-/**
- * Ensure a guild exists (upsert). Called on guildCreate or first interaction.
- */
+// ─── Guild Operations ───────────────────────────────────────────────────────
+
 async function ensureGuild(guildId, guildName, ownerId) {
   const { error } = await supabase
     .from("guilds")
@@ -67,11 +60,35 @@ async function ensureGuild(guildId, guildName, ownerId) {
   if (error) throw error;
 }
 
+async function getGuild(guildId) {
+  const { data, error } = await supabase
+    .from("guilds")
+    .select("*")
+    .eq("id", guildId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function getAllGuilds() {
+  const { data, error } = await supabase.from("guilds").select("*");
+  if (error) throw error;
+  return data || [];
+}
+
+async function getGuildStats(guildId) {
+  const [repos, admins] = await Promise.all([
+    getAllRepositories(guildId),
+    getAllAdmins(guildId),
+  ]);
+  return {
+    repos: repos.length,
+    admins: admins.length,
+  };
+}
+
 // ─── Repository Operations ──────────────────────────────────────────────────
 
-/**
- * Add a new repository to monitor
- */
 async function addRepository(guildId, owner, name, channelId, createdBy, options = {}) {
   const fullName = `${owner}/${name}`;
 
@@ -84,10 +101,8 @@ async function addRepository(guildId, owner, name, channelId, createdBy, options
       full_name: fullName,
       channel_id: channelId,
       created_by: createdBy,
-      github_token_id: options.tokenId || null,
       webhook_secret: options.webhookSecret || null,
       webhook_token: options.webhookToken || generateWebhookToken(),
-      poll_enabled: options.pollEnabled || false,
     })
     .select()
     .single();
@@ -101,23 +116,16 @@ async function addRepository(guildId, owner, name, channelId, createdBy, options
   return data;
 }
 
-/**
- * Get repository by ID
- */
 async function getRepositoryById(id) {
   const { data, error } = await supabase
     .from("repositories")
     .select("*")
     .eq("id", id)
     .single();
-
   if (error && error.code !== "PGRST116") throw error;
   return data;
 }
 
-/**
- * Get repository by full_name (owner/name) within a guild
- */
 async function getRepositoryByFullName(guildId, fullName) {
   const { data, error } = await supabase
     .from("repositories")
@@ -125,14 +133,10 @@ async function getRepositoryByFullName(guildId, fullName) {
     .eq("guild_id", guildId)
     .eq("full_name", fullName)
     .single();
-
   if (error && error.code !== "PGRST116") throw error;
   return data;
 }
 
-/**
- * Get repository by its random webhook path token
- */
 async function getRepositoryByWebhookToken(token) {
   if (!token || typeof token !== "string") return null;
   const { data, error } = await supabase
@@ -140,14 +144,10 @@ async function getRepositoryByWebhookToken(token) {
     .select("*")
     .eq("webhook_token", token)
     .maybeSingle();
-
   if (error) throw error;
   return data;
 }
 
-/**
- * Get all active repositories for a guild
- */
 async function getAllRepositories(guildId) {
   const { data, error } = await supabase
     .from("repositories")
@@ -155,102 +155,46 @@ async function getAllRepositories(guildId) {
     .eq("guild_id", guildId)
     .eq("is_active", true)
     .order("full_name");
-
   if (error) throw error;
   return data || [];
 }
 
-/**
- * Get all guilds (used by health check and webhook routing)
- */
-async function getAllGuilds() {
-  const { data, error } = await supabase.from("guilds").select("*");
-  if (error) throw error;
-  return data || [];
-}
-
-/**
- * Get all pollable repositories across all guilds
- */
-async function getAllPollableRepositories() {
-  const { data, error } = await supabase
-    .from("repositories")
-    .select("*, guilds!inner(id, name)")
-    .eq("is_active", true)
-    .eq("poll_enabled", true);
-
-  if (error) throw error;
-  return data || [];
-}
-
-/**
- * Get all pollable repositories for a specific guild
- */
-async function getPollableRepositories(guildId) {
+async function getAllRepositoriesAcrossGuilds() {
   const { data, error } = await supabase
     .from("repositories")
     .select("*")
-    .eq("guild_id", guildId)
     .eq("is_active", true)
-    .eq("poll_enabled", true);
-
+    .order("full_name");
   if (error) throw error;
   return data || [];
 }
 
-/**
- * Update repository settings
- */
 async function updateRepository(id, updates) {
   const allowed = [
-    "channel_id", "webhook_secret", "github_token_id",
-    "poll_enabled", "default_branch", "last_commit_sha", "last_polled_at",
-    "is_active", "error_message",
+    "channel_id", "webhook_secret", "is_active", "error_message",
   ];
-
   const patch = {};
   for (const [key, value] of Object.entries(updates)) {
-    if (allowed.includes(key)) {
-      patch[key] = value;
-    }
+    if (allowed.includes(key)) patch[key] = value;
   }
-
   if (Object.keys(patch).length === 0) return;
-
-  const { error } = await supabase
-    .from("repositories")
-    .update(patch)
-    .eq("id", id);
-
+  const { error } = await supabase.from("repositories").update(patch).eq("id", id);
   if (error) throw error;
 }
 
-/**
-  * Hard delete a repository (guild-scoped)
-  */
-  async function deleteRepository(idOrFullName, guildId) {
-    const isNumeric = /^\d+$/.test(String(idOrFullName));
-    const col = isNumeric ? "id" : "full_name";
+async function deleteRepository(idOrFullName, guildId) {
+  const isNumeric = /^\d+$/.test(String(idOrFullName));
+  const col = isNumeric ? "id" : "full_name";
 
-    const query = supabase
-      .from("repositories")
-      .delete()
-      .eq(col, idOrFullName);
+  const query = supabase.from("repositories").delete().eq(col, idOrFullName);
+  if (!isNumeric && guildId) query.eq("guild_id", guildId);
 
-    if (!isNumeric && guildId) {
-      query.eq("guild_id", guildId);
-    }
-
-    const { error } = await query;
-
-    if (error) throw error;
-  }
+  const { error } = await query;
+  if (error) throw error;
+}
 
 // ─── Admin Operations ───────────────────────────────────────────────────────
 
-/**
- * Add an admin (per guild)
- */
 async function addAdmin(guildId, discordUserId, username, addedBy) {
   const { error } = await supabase
     .from("admins")
@@ -260,26 +204,18 @@ async function addAdmin(guildId, discordUserId, username, addedBy) {
       username,
       added_by: addedBy,
     }, { onConflict: "guild_id,discord_user_id" });
-
   if (error) throw error;
 }
 
-/**
- * Remove an admin (per guild)
- */
 async function removeAdmin(guildId, discordUserId) {
   const { error } = await supabase
     .from("admins")
     .delete()
     .eq("guild_id", guildId)
     .eq("discord_user_id", discordUserId);
-
   if (error) throw error;
 }
 
-/**
- * Check if user is an admin in a guild
- */
 async function isAdmin(guildId, discordUserId) {
   const { data, error } = await supabase
     .from("admins")
@@ -287,176 +223,369 @@ async function isAdmin(guildId, discordUserId) {
     .eq("guild_id", guildId)
     .eq("discord_user_id", discordUserId)
     .maybeSingle();
-
   if (error) throw error;
   return !!data;
 }
 
-/**
- * Get all admins for a guild
- */
 async function getAllAdmins(guildId) {
   const { data, error } = await supabase
     .from("admins")
     .select("*")
     .eq("guild_id", guildId)
     .order("username");
-
   if (error) throw error;
   return data || [];
 }
 
-// ─── GitHub Token Operations ────────────────────────────────────────────────
+// ─── Per-Repository Event Configuration ────────────────────────────────────
+
+const SUPPORTED_EVENTS = [
+  "push", "pull_request", "issues", "issue_comment",
+  "pull_request_review", "release", "workflow_run",
+  "star", "fork", "create", "delete", "check_run", "deployment_status",
+];
 
 /**
- * Add a GitHub token (per guild)
+ * Get event configuration for a repository.
+ * Returns a Map of { eventType → enabled (boolean) }.
+ * If a row doesn't exist for an event, it defaults to enabled=true.
  */
-async function addToken(guildId, token, userId, description, isDefault = false) {
-  if (isDefault) {
-    await supabase
-      .from("github_tokens")
-      .update({ is_default: false })
-      .eq("guild_id", guildId);
-  }
-
+async function getRepositoryEventConfig(repositoryId) {
   const { data, error } = await supabase
-    .from("github_tokens")
-    .insert({
-      guild_id: guildId,
-      token,
-      user_id: userId,
-      description,
-      is_default: isDefault,
-    })
+    .from("repository_events")
+    .select("*")
+    .eq("repository_id", repositoryId);
+  if (error) throw error;
+
+  const config = {};
+  // Default all events to enabled
+  for (const evt of SUPPORTED_EVENTS) {
+    config[evt] = true;
+  }
+  // Override with stored values
+  for (const row of (data || [])) {
+    config[row.event_type] = row.enabled;
+  }
+  return config;
+}
+
+/**
+ * Check if a specific event is enabled for a repository.
+ * Defaults to true if no row exists.
+ */
+async function isEventEnabled(repositoryId, eventType) {
+  const { data, error } = await supabase
+    .from("repository_events")
+    .select("enabled")
+    .eq("repository_id", repositoryId)
+    .eq("event_type", eventType)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) return true; // default: enabled
+  return data.enabled;
+}
+
+/**
+ * Set event enabled/disabled for a repository.
+ * Uses upsert — creates the row if it doesn't exist.
+ */
+async function setEventEnabled(repositoryId, eventType, enabled) {
+  const { error } = await supabase
+    .from("repository_events")
+    .upsert(
+      { repository_id: repositoryId, event_type: eventType, enabled },
+      { onConflict: "repository_id,event_type" }
+    );
+  if (error) throw error;
+}
+
+/**
+ * Bulk update all event types for a repository from a config object.
+ * config = { push: true, pull_request: false, ... }
+ */
+async function setRepositoryEventConfig(repositoryId, config) {
+  const rows = Object.entries(config).map(([event_type, enabled]) => ({
+    repository_id: repositoryId,
+    event_type,
+    enabled: !!enabled,
+  }));
+
+  const { error } = await supabase
+    .from("repository_events")
+    .upsert(rows, { onConflict: "repository_id,event_type" });
+  if (error) throw error;
+}
+
+// ─── Notification Destinations ──────────────────────────────────────────────
+
+/**
+ * Add a notification destination (WhatsApp group or Discord channel override).
+ * type: 'whatsapp' | 'discord'
+ * identifier: WhatsApp group JID or Discord channel ID
+ */
+async function addDestination(guildId, type, name, identifier) {
+  const { data, error } = await supabase
+    .from("notification_destinations")
+    .insert({ guild_id: guildId, type, name, identifier })
     .select()
     .single();
-
   if (error) throw error;
   return data;
 }
 
-/**
- * Get the default token for a guild
- */
-async function getDefaultToken(guildId) {
+async function getDestination(id) {
   const { data, error } = await supabase
-    .from("github_tokens")
-    .select("*")
-    .eq("guild_id", guildId)
-    .eq("is_default", true)
-    .limit(1)
-    .maybeSingle();
-
-  if (error) throw error;
-  return data;
-}
-
-/**
- * Get token by ID
- */
-async function getTokenById(id) {
-  const { data, error } = await supabase
-    .from("github_tokens")
+    .from("notification_destinations")
     .select("*")
     .eq("id", id)
     .maybeSingle();
-
   if (error) throw error;
   return data;
 }
 
-/**
- * Update token rate limit info
- */
-async function updateTokenRateLimit(tokenId, remaining, resetTime) {
-  const { error } = await supabase
-    .from("github_tokens")
-    .update({ rate_limit_remaining: remaining, rate_limit_reset: resetTime })
-    .eq("id", tokenId);
-
-  if (error) throw error;
-}
-
-/**
- * Get all tokens for a guild (without exposing the token value)
- */
-async function getAllTokens(guildId) {
+async function getAllDestinations(guildId) {
   const { data, error } = await supabase
-    .from("github_tokens")
-    .select("id, user_id, description, rate_limit_remaining, rate_limit_reset, created_at, is_default")
-    .eq("guild_id", guildId);
-
+    .from("notification_destinations")
+    .select("*")
+    .eq("guild_id", guildId)
+    .eq("active", true)
+    .order("name");
   if (error) throw error;
   return data || [];
 }
 
-/**
- * Remove a token (guild-scoped — a guild can only delete its own tokens)
- * @returns {Promise<boolean>} true if a row was deleted
- */
-async function removeToken(id, guildId) {
-  const query = supabase
-    .from("github_tokens")
-    .delete({ count: "exact" })
+async function updateDestination(id, updates) {
+  const allowed = ["name", "identifier", "active"];
+  const patch = {};
+  for (const [k, v] of Object.entries(updates)) {
+    if (allowed.includes(k)) patch[k] = v;
+  }
+  if (Object.keys(patch).length === 0) return;
+  const { error } = await supabase
+    .from("notification_destinations")
+    .update(patch)
     .eq("id", id);
-  if (guildId) query.eq("guild_id", guildId);
-
-  const { count, error } = await query;
   if (error) throw error;
-  return count > 0;
 }
 
-// ─── Guild Operations ───────────────────────────────────────────────────────
+async function deleteDestination(id) {
+  const { error } = await supabase
+    .from("notification_destinations")
+    .delete()
+    .eq("id", id);
+  if (error) throw error;
+}
+
+// ─── Repository-Event-Destination Mappings ──────────────────────────────────
 
 /**
- * Get a guild by ID
+ * Add a mapping: repository + event_type → destination.
+ * Pass event_type = null to apply to ALL events.
  */
-async function getGuild(guildId) {
+async function addDestinationMapping(repositoryId, eventType, destinationId) {
   const { data, error } = await supabase
-    .from("guilds")
-    .select("*")
-    .eq("id", guildId)
-    .maybeSingle();
-
+    .from("repository_event_destinations")
+    .insert({
+      repository_id: repositoryId,
+      event_type: eventType || null,
+      destination_id: destinationId,
+    })
+    .select()
+    .single();
   if (error) throw error;
   return data;
 }
 
+async function removeDestinationMapping(id) {
+  const { error } = await supabase
+    .from("repository_event_destinations")
+    .delete()
+    .eq("id", id);
+  if (error) throw error;
+}
+
 /**
- * Get guild webhook URL (for display)
+ * Get all destination mappings for a repository + event combo.
+ * Falls back to repo-level mappings (event_type IS NULL) if no event-specific ones exist.
  */
-async function getGuildStats(guildId) {
-  const [repos, pollable, admins, tokens] = await Promise.all([
+async function getDestinationsForEvent(repositoryId, eventType) {
+  // Try event-specific first
+  const { data: specific, error: e1 } = await supabase
+    .from("repository_event_destinations")
+    .select("*, notification_destinations(*)")
+    .eq("repository_id", repositoryId)
+    .eq("event_type", eventType);
+  if (e1) throw e1;
+
+  if (specific && specific.length > 0) {
+    return specific
+      .filter(m => m.notification_destinations?.active)
+      .map(m => m.notification_destinations);
+  }
+
+  // Fall back to repo-level (event_type IS NULL)
+  const { data: general, error: e2 } = await supabase
+    .from("repository_event_destinations")
+    .select("*, notification_destinations(*)")
+    .eq("repository_id", repositoryId)
+    .is("event_type", null);
+  if (e2) throw e2;
+
+  return (general || [])
+    .filter(m => m.notification_destinations?.active)
+    .map(m => m.notification_destinations);
+}
+
+async function getAllMappingsForRepository(repositoryId) {
+  const { data, error } = await supabase
+    .from("repository_event_destinations")
+    .select("*, notification_destinations(*)")
+    .eq("repository_id", repositoryId);
+  if (error) throw error;
+  return data || [];
+}
+
+// ─── Event Logging ──────────────────────────────────────────────────────────
+
+/**
+ * Log a received GitHub event.
+ * status: 'processed' | 'ignored' | 'failed'
+ */
+async function logEvent(repositoryId, eventType, action, status, reason, metadata) {
+  const { data, error } = await supabase
+    .from("event_logs")
+    .insert({
+      repository_id: repositoryId,
+      event_type: eventType,
+      action: action || null,
+      status,
+      reason: reason || null,
+      metadata: metadata || null,
+    })
+    .select("id")
+    .single();
+  if (error) {
+    // Non-fatal — log to console but don't crash webhook handling
+    console.error("[db] Failed to write event log:", error.message);
+    return null;
+  }
+  return data.id;
+}
+
+/**
+ * Get recent event logs, optionally filtered by repository.
+ */
+async function getEventLogs(options = {}) {
+  let query = supabase
+    .from("event_logs")
+    .select("*, repositories(full_name, guild_id)")
+    .order("created_at", { ascending: false })
+    .limit(options.limit || 50);
+
+  if (options.repositoryId) query = query.eq("repository_id", options.repositoryId);
+  if (options.guildId) {
+    query = query.eq("repositories.guild_id", options.guildId);
+  }
+  if (options.status) query = query.eq("status", options.status);
+
+  const { data, error } = await query;
+  if (error) throw error;
+  return data || [];
+}
+
+// ─── Notification Logging ────────────────────────────────────────────────────
+
+/**
+ * Log a notification delivery attempt.
+ * status: 'sent' | 'failed' | 'skipped'
+ */
+async function logNotification(eventLogId, destinationId, destinationType, status, errorMessage) {
+  const { error } = await supabase
+    .from("notification_logs")
+    .insert({
+      event_log_id: eventLogId || null,
+      destination_id: destinationId || null,
+      destination_type: destinationType,
+      status,
+      error_message: errorMessage || null,
+    });
+  if (error) {
+    // Non-fatal
+    console.error("[db] Failed to write notification log:", error.message);
+  }
+}
+
+async function getNotificationLogs(options = {}) {
+  let query = supabase
+    .from("notification_logs")
+    .select("*, notification_destinations(name, type)")
+    .order("sent_at", { ascending: false })
+    .limit(options.limit || 50);
+
+  if (options.eventLogId) query = query.eq("event_log_id", options.eventLogId);
+  if (options.destinationId) query = query.eq("destination_id", options.destinationId);
+
+  const { data, error } = await query;
+  if (error) throw error;
+  return data || [];
+}
+
+// ─── Dashboard Stats ────────────────────────────────────────────────────────
+
+async function getDashboardStats(guildId) {
+  const [repos, admins, destinations] = await Promise.all([
     getAllRepositories(guildId),
-    getPollableRepositories(guildId),
     getAllAdmins(guildId),
-    getAllTokens(guildId),
+    getAllDestinations(guildId),
   ]);
+
+  // Event log counts
+  const { data: logCounts, error: logErr } = await supabase
+    .from("event_logs")
+    .select("status, repositories!inner(guild_id)")
+    .eq("repositories.guild_id", guildId);
+
+  let processed = 0, ignored = 0, failed = 0;
+  if (!logErr && logCounts) {
+    for (const row of logCounts) {
+      if (row.status === "processed") processed++;
+      else if (row.status === "ignored") ignored++;
+      else if (row.status === "failed") failed++;
+    }
+  }
+
+  // Notification counts
+  const { count: notifCount } = await supabase
+    .from("notification_logs")
+    .select("id", { count: "exact", head: true })
+    .eq("status", "sent");
 
   return {
     repos: repos.length,
-    pollable: pollable.length,
     admins: admins.length,
-    tokens: tokens.length,
+    destinations: destinations.length,
+    events: { processed, ignored, failed, total: processed + ignored + failed },
+    notificationsSent: notifCount || 0,
   };
 }
 
 module.exports = {
   init,
   generateWebhookToken,
-  ensureGuild,
+  SUPPORTED_EVENTS,
   // Guild
+  ensureGuild,
   getGuild,
   getAllGuilds,
   getGuildStats,
+  getDashboardStats,
   // Repository
   addRepository,
   getRepositoryById,
   getRepositoryByFullName,
   getRepositoryByWebhookToken,
   getAllRepositories,
-  getPollableRepositories,
-  getAllPollableRepositories,
+  getAllRepositoriesAcrossGuilds,
   updateRepository,
   deleteRepository,
   // Admin
@@ -464,11 +593,25 @@ module.exports = {
   removeAdmin,
   isAdmin,
   getAllAdmins,
-  // Token
-  addToken,
-  getDefaultToken,
-  getTokenById,
-  updateTokenRateLimit,
-  getAllTokens,
-  removeToken,
+  // Event config
+  getRepositoryEventConfig,
+  isEventEnabled,
+  setEventEnabled,
+  setRepositoryEventConfig,
+  // Destinations
+  addDestination,
+  getDestination,
+  getAllDestinations,
+  updateDestination,
+  deleteDestination,
+  // Mappings
+  addDestinationMapping,
+  removeDestinationMapping,
+  getDestinationsForEvent,
+  getAllMappingsForRepository,
+  // Logging
+  logEvent,
+  getEventLogs,
+  logNotification,
+  getNotificationLogs,
 };

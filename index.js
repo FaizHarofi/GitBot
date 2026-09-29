@@ -1,6 +1,6 @@
-// index.js — GitBot V4 entry point (multi-tenant)
+// index.js — GitBot V5 entry point
 // ─────────────────────────────────────────────────────────────────────────────
-// Bootstrap only: load config, wire handlers, start the webhook server.
+// Bootstrap only: load config, wire handlers, start the webhook + dashboard server.
 // Feature code lives under src/.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -14,28 +14,17 @@ const client = require("./src/bot/client");
 const { handleInteraction } = require("./src/bot/handlers/interaction");
 const { handleReady } = require("./src/bot/handlers/ready");
 const { handleGuildCreate, handleGuildDelete } = require("./src/bot/handlers/guild");
-const { handlePolledEvent } = require("./src/web/webhook");
 const { startServer } = require("./src/web/server");
-const { GitHubPoller } = require("./src/github/poller");
 
 // ─── Initialize Database ───────────────────────────────────────────────────────
 
 db.init();
 console.log("[db] Database initialized");
 
-// ─── GitHub Poller (fallback for repos without webhooks) ──────────────────────
-
-const githubPoller = new GitHubPoller({
-  interval: 60000,
-  onEvent: (eventType, payload, repo) => {
-    handlePolledEvent(eventType, payload, repo, client);
-  },
-});
-
 // ─── Wire Discord events ──────────────────────────────────────────────────────
 
 client.on("interactionCreate", handleInteraction);
-client.once("ready", () => handleReady(githubPoller));
+client.once("ready", () => handleReady());
 client.on("guildCreate", handleGuildCreate);
 client.on("guildDelete", handleGuildDelete);
 
