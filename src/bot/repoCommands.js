@@ -3,7 +3,6 @@
 
 "use strict";
 
-const os = require("os");
 const {
   SlashCommandBuilder,
   EmbedBuilder,
@@ -12,31 +11,12 @@ const {
   ButtonStyle,
 } = require("discord.js");
 
-const db = require("./database");
+const db = require("../db/database");
+const { getBaseUrl } = require("../config");
 
 // ─── In-memory pending setup tracker ─────────────────────────────────────────
 /** @type {Map<number, {adminUserId: string, targetUserId: string|null, dmMessageId: string|null}>} */
 const _pendingSetup = new Map();
-
-// ─── Local IP helper ─────────────────────────────────────────────────────────
-
-function getLocalIP() {
-  const interfaces = os.networkInterfaces();
-  for (const name of Object.keys(interfaces)) {
-    for (const iface of interfaces[name]) {
-      if (iface.family === "IPv4" && !iface.internal) {
-        return iface.address;
-      }
-    }
-  }
-  return "127.0.0.1";
-}
-
-function getBaseUrl() {
-  const localIP = getLocalIP();
-  const port = process.env.PORT || process.env.WEBHOOK_PORT || 3000;
-  return (process.env.WEBHOOK_BASE_URL || `http://${localIP}:${port}`).replace(/\/$/, "");
-}
 
 // ─── Command Definitions ────────────────────────────────────────────────────────
 
@@ -234,12 +214,29 @@ async function handleRepoAdd(interaction) {
       return interaction.editReply({ content: `❌ Failed to create channel: ${err.message}` });
     }
 
+    // Polling mode needs a stored GitHub token (see /token add)
+    let tokenId = null;
+    if (usePolling) {
+      const defaultToken = await db.getDefaultToken(guildId);
+      if (!defaultToken) {
+        return interaction.editReply({
+          content:
+            "❌ **Polling mode needs a GitHub token first.**\n\n" +
+            "1. Run `/token add` with a GitHub PAT (Settings → Developer settings → Personal access tokens)\n" +
+            "2. Then run `/repo add` again\n\n" +
+            "_Tip: unless you can't expose a public URL, prefer webhook mode — it's real-time and needs no token._",
+        });
+      }
+      tokenId = defaultToken.id;
+    }
+
     // Generate secret and register repo
     const crypto = require("crypto");
     const webhookSecret = crypto.randomBytes(32).toString("hex");
 
     const repo = await db.addRepository(guildId, owner, name, channelId, interaction.user.id, {
       webhookSecret,
+      tokenId,
       pollEnabled: usePolling || false,
     });
 
@@ -249,9 +246,9 @@ async function handleRepoAdd(interaction) {
       dmMessageId: null,
     });
 
-    // Build webhook URL
+    // Build webhook URL (random token — not guessable like a sequential ID)
     const baseUrl = getBaseUrl();
-    const webhookUrl = `${baseUrl}/webhook/${repo.id}`;
+    const webhookUrl = `${baseUrl}/webhook/${repo.webhook_token}`;
 
     // Admin reply
     const adminEmbed = new EmbedBuilder()
@@ -465,6 +462,13 @@ async function handleRepoInfo(interaction) {
       embed.addFields({
         name: "⚠️ Error",
         value: repo.error_message,
+      });
+    }
+
+    if (!repo.poll_enabled && repo.webhook_token) {
+      embed.addFields({
+        name: "🔗 Payload URL",
+        value: `\`${getBaseUrl()}/webhook/${repo.webhook_token}\``,
       });
     }
 

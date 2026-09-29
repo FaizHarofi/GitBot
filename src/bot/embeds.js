@@ -1,8 +1,21 @@
 // embeds.js — formats GitHub webhook payloads into Discord embeds
+// Also hosts bot-facing embeds: /status, /events, and the /digest payload.
 
 "use strict";
 
-const { EmbedBuilder } = require("discord.js");
+const {
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} = require("discord.js");
+
+const client = require("./client");
+const mutes = require("./mutes");
+const digest = require("./digest");
+const { rowDismiss } = require("./components");
+const { stats } = require("../stats");
+const { PORT } = require("../config");
 
 // ─── Color palette ────────────────────────────────────────────────────────────
 
@@ -388,4 +401,115 @@ function buildEmbed(eventType, payload) {
   }
 }
 
-module.exports = { buildEmbed };
+// ─── Bot-facing embeds (/status, /events) ─────────────────────────────────────
+
+function buildStatusEmbed() {
+  const sec = Math.floor((Date.now() - stats.startTime) / 1000);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+
+  const activeMutes = mutes.list();
+  const muteStr = activeMutes.length
+    ? activeMutes.map(mu => {
+        const left = Math.ceil((mu.expiresAt.getTime() - Date.now()) / 60_000);
+        return `\`${mu.eventType}\` (${left}m left)`;
+      }).join(", ")
+    : "_none_";
+
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle("🤖 GitBot V4 — Status")
+    .setThumbnail(client.user.displayAvatarURL())
+    .addFields(
+      { name: "🟢 Bot", value: `**${client.user.tag}**`, inline: false },
+      { name: "⏱️ Uptime", value: `${h}h ${m}m ${s}s`, inline: true },
+      { name: "📡 WS Ping", value: `${client.ws.ping}ms`, inline: true },
+      { name: "📦 Port", value: String(PORT), inline: true },
+      { name: "📬 Received", value: String(stats.eventsReceived), inline: true },
+      { name: "✉️ Sent", value: String(stats.eventsSent), inline: true },
+      { name: "🔇 Muted", value: String(stats.eventsMuted), inline: true },
+      { name: "🚫 Dropped", value: String(stats.eventsDropped), inline: true },
+      { name: "⏭️ Ignored", value: String(stats.eventsIgnored), inline: true },
+      { name: "🔕 Active mutes", value: muteStr, inline: false },
+    )
+    .setFooter({
+      text: stats.lastEvent
+        ? `Last: ${stats.lastEvent} at ${stats.lastEventTime?.toLocaleTimeString()}`
+        : "No events yet",
+    })
+    .setTimestamp();
+}
+
+function buildEventsEmbed() {
+  if (stats.eventsReceived === 0) return null;
+
+  const rows = Object.entries(stats.eventCounts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([evt, count]) => {
+      const pct = Math.round((count / stats.eventsReceived) * 10);
+      const bar = "█".repeat(pct) + "░".repeat(10 - pct);
+      const muted = mutes.isMuted(evt) ? " 🔇" : "";
+      return `\`${evt.padEnd(22)}\` **${count}** \`${bar}\`${muted}`;
+    })
+    .join("\n");
+
+  return new EmbedBuilder()
+    .setColor(0xF39C12)
+    .setTitle(`📊 Event Breakdown — ${stats.eventsReceived} total`)
+    .setDescription(rows)
+    .setFooter({
+      text: `${stats.eventsSent} sent · ${stats.eventsMuted} muted · ${stats.eventsDropped} dropped · ${stats.eventsIgnored} ignored`,
+    })
+    .setTimestamp();
+}
+
+// ─── Digest payload builder ───────────────────────────────────────────────────
+
+function buildDigestPayload(entries, currentCount) {
+  const total = digest.size();
+
+  if (entries.length === 0) {
+    return {
+      content: "📭 No events in the digest yet. Events appear here once GitHub starts sending webhooks.",
+      embeds: [],
+      components: [rowDismiss("digest:dismiss")],
+    };
+  }
+
+  const lines = [...entries].reverse().map(e => {
+    const ts = `<t:${Math.floor(e.timestamp.getTime() / 1000)}:R>`;
+    const link = e.url ? ` — [↗](${e.url})` : "";
+    const icon = e.outcome === "sent" ? "✅" : e.outcome === "muted" ? "🔇" : "⏭️";
+    return `${icon} ${ts} ${e.summary}${link}`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle(`📋 Recent Activity — last ${entries.length} event${entries.length !== 1 ? "s" : ""}`)
+    .setDescription(lines.join("\n"))
+    .setFooter({
+      text: `${total} events in buffer  ·  ✅ sent  ·  🔇 muted  ·  ⏭️ ignored/dropped`,
+    })
+    .setTimestamp();
+
+  const canLoadMore = currentCount < Math.min(total, 50);
+  const row = new ActionRowBuilder().addComponents(
+    ...(canLoadMore
+      ? [new ButtonBuilder()
+          .setCustomId(`digest:more:${currentCount}`)
+          .setLabel("Load more")
+          .setEmoji("⬆️")
+          .setStyle(ButtonStyle.Secondary)]
+      : []),
+    new ButtonBuilder()
+      .setCustomId("digest:dismiss")
+      .setLabel("Dismiss")
+      .setEmoji("🗑️")
+      .setStyle(ButtonStyle.Secondary),
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+module.exports = { buildEmbed, buildStatusEmbed, buildEventsEmbed, buildDigestPayload };

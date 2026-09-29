@@ -199,7 +199,7 @@ class GitHubPoller {
    * Poll all enabled repositories across all guilds
    */
   async _poll() {
-    const db = require("./database");
+    const db = require("../db/database");
 
     try {
       const repos = await db.getAllPollableRepositories();
@@ -220,7 +220,7 @@ class GitHubPoller {
    * Poll a single repository
    */
   async _pollRepo(repo) {
-    const db = require("./database");
+    const db = require("../db/database");
 
     // Get token for this repo
     let token = null;
@@ -323,7 +323,7 @@ class GitHubPoller {
   }
 
   async pollNow(repoFullName) {
-    const db = require("./database");
+    const db = require("../db/database");
 
     // Try to find across all guilds
     const allRepos = await db.getAllPollableRepositories();

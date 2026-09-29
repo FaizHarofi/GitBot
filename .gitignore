@@ -27,3 +27,8 @@ Thumbs.db
 # OS
 *.swp
 *.swo
+# Runtime files
+*.err
+tunnel.url
+named.*
+bot.*

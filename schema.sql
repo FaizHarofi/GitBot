@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS repositories (
   full_name TEXT NOT NULL,
   channel_id TEXT,                        -- Discord channel ID for notifications
   webhook_secret TEXT,
+  webhook_token TEXT UNIQUE,              -- random path token: /webhook/<token>
   webhook_id TEXT,
   github_token_id BIGINT,
   poll_enabled BOOLEAN DEFAULT FALSE,
@@ -59,9 +60,14 @@ CREATE TABLE IF NOT EXISTS admins (
 CREATE INDEX IF NOT EXISTS idx_repos_guild ON repositories(guild_id);
 CREATE INDEX IF NOT EXISTS idx_repos_full_name ON repositories(full_name);
 CREATE INDEX IF NOT EXISTS idx_repos_active ON repositories(is_active);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_webhook_token ON repositories(webhook_token);
 CREATE INDEX IF NOT EXISTS idx_tokens_guild ON github_tokens(guild_id);
 CREATE INDEX IF NOT EXISTS idx_tokens_default ON github_tokens(is_default);
 CREATE INDEX IF NOT EXISTS idx_admins_guild ON admins(guild_id);
+
+-- ═══ Migration: existing databases ═══
+-- Run once on databases created before webhook_token existed:
+-- ALTER TABLE repositories ADD COLUMN IF NOT EXISTS webhook_token TEXT UNIQUE;
 
 -- ═══ Row-Level Security (RLS) — Optional but recommended ═══
 -- Uncomment these to enable RLS for extra security

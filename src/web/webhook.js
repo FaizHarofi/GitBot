@@ -1,5 +1,5 @@
-// multiWebhook.js — Express webhook server (multi-tenant)
-// Routes webhooks to the correct repository and guild based on repo ID
+// webhook.js — Express webhook server (multi-tenant)
+// Routes GitHub webhooks to the correct repository by random token (or legacy ID).
 
 "use strict";
 
@@ -8,35 +8,12 @@ const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
 const { EmbedBuilder } = require("discord.js");
 
-const db = require("./database");
-const { buildEmbed } = require("./embeds");
-const digest = require("./digest");
-const mutes = require("./mutes");
-
-// ─── Stats ───────────────────────────────────────────────────────────────────
-
-const stats = {
-  eventsReceived: 0,
-  eventsSent: 0,
-  eventsDropped: 0,
-  eventsIgnored: 0,
-  eventsMuted: 0,
-  startTime: Date.now(),
-  lastEvent: null,
-  lastEventTime: null,
-  eventCounts: {},
-};
-
-function recordEvent(eventType, outcome) {
-  stats.eventsReceived++;
-  stats.lastEvent = eventType;
-  stats.lastEventTime = new Date();
-  stats.eventCounts[eventType] = (stats.eventCounts[eventType] || 0) + 1;
-  if (outcome === "sent") stats.eventsSent++;
-  else if (outcome === "dropped") stats.eventsDropped++;
-  else if (outcome === "muted") stats.eventsMuted++;
-  else stats.eventsIgnored++;
-}
+const db = require("../db/database");
+const { buildEmbed } = require("../bot/embeds");
+const digest = require("../bot/digest");
+const mutes = require("../bot/mutes");
+const { stats, recordEvent } = require("../stats");
+const { logError } = require("../errors");
 
 // ─── Signature Verification ───────────────────────────────────────────────────
 
@@ -129,17 +106,31 @@ function createWebhookRouter(client) {
         },
       });
     } catch (err) {
+      logError("health", err);
       res.status(500).json({ error: err.message });
     }
   });
 
-  // Per-repository webhook: /webhook/:repoId
-  router.post("/webhook/:repoId", webhookLimiter, (req, res) => {
-    const repoId = parseInt(req.params.repoId, 10);
-    if (isNaN(repoId)) {
-      return res.status(400).send("Invalid repository ID");
+  // Per-repository webhook: /webhook/:token (random hex) or legacy /webhook/:id
+  router.post("/webhook/:id", webhookLimiter, async (req, res) => {
+    const id = req.params.id;
+
+    try {
+      let repo = null;
+      if (/^\d+$/.test(id)) {
+        repo = await db.getRepositoryById(parseInt(id, 10));
+      } else {
+        repo = await db.getRepositoryByWebhookToken(id);
+      }
+
+      if (!repo) {
+        return res.status(404).send("Repository not found");
+      }
+      handleWebhook(req, res, client, repo);
+    } catch (err) {
+      logError("webhook.route", err, { path: id });
+      res.status(500).json({ error: "Internal error" });
     }
-    handleWebhook(req, res, client, repoId);
   });
 
   // Per-repository webhook by name: /webhook/:owner/:repo
@@ -152,7 +143,7 @@ function createWebhookRouter(client) {
     for (const guild of allGuilds) {
       const repoData = await db.getRepositoryByFullName(guild.id, fullName);
       if (repoData) {
-        return handleWebhook(req, res, client, repoData.id);
+        return handleWebhook(req, res, client, repoData);
       }
     }
 
@@ -164,7 +155,7 @@ function createWebhookRouter(client) {
 
 // ─── Main webhook handler ─────────────────────────────────────────────────────
 
-async function handleWebhook(req, res, client, repoId) {
+async function handleWebhook(req, res, client, repo) {
   const sig = req.headers["x-hub-signature-256"];
   const eventType = req.headers["x-github-event"];
   const payload = req.body;
@@ -173,24 +164,8 @@ async function handleWebhook(req, res, client, repoId) {
     return res.status(400).send("Missing X-GitHub-Event header");
   }
 
-  // Look up repo by ID (includes guild_id from the join)
-  let repo = null;
-  if (repoId) {
-    repo = await db.getRepositoryById(repoId);
-  } else {
-    const repoFullName = payload?.repository?.full_name;
-    if (repoFullName) {
-      // Search across all guilds
-      const allGuilds = await db.getAllGuilds();
-      for (const guild of allGuilds) {
-        repo = await db.getRepositoryByFullName(guild.id, repoFullName);
-        if (repo) break;
-      }
-    }
-  }
-
   if (!repo) {
-    console.log(`[webhook] No repo found for ID ${repoId}, ignoring`);
+    console.log(`[webhook] No repo matched, ignoring`);
     digest.push(eventType, payload, "ignored");
     recordEvent(eventType, "ignored");
     return res.status(404).send("Repository not found");
@@ -297,7 +272,7 @@ async function handleWebhook(req, res, client, repoId) {
     console.log(`[webhook] "${eventType}" from ${repo.full_name} → #${channel.name}`);
 
   } catch (err) {
-    console.error(`[webhook] Error on "${eventType}" from ${repo.full_name}: ${err.message}`);
+    logError("webhook", err, { event: eventType, repo: repo.full_name, guild: repo.guild_id });
     digest.push(eventType, payload, "dropped", repo.full_name);
     recordEvent(eventType, "dropped");
   }
@@ -341,7 +316,7 @@ async function handlePolledEvent(eventType, payload, repo, client) {
     digest.push(eventType, payload, "sent", repo.full_name);
     recordEvent(eventType, "sent");
   } catch (err) {
-    console.error(`[poller] Error: ${err.message}`);
+    logError("poller", err, { event: eventType, repo: repo.full_name });
     digest.push(eventType, payload, "dropped", repo.full_name);
     recordEvent(eventType, "dropped");
   }
@@ -353,5 +328,4 @@ module.exports = {
   createWebhookRouter,
   handlePolledEvent,
   verifySignature,
-  stats,
 };

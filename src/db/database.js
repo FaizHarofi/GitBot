@@ -3,6 +3,7 @@
 
 "use strict";
 
+const crypto = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
 
 let supabase;
@@ -22,6 +23,38 @@ function init() {
 
   supabase = createClient(url, key);
   console.log("[db] Supabase connected");
+
+  backfillWebhookTokens().catch(err => {
+    const { logError } = require("../errors");
+    logError("db", err, { step: "backfill-webhook-tokens" });
+  });
+}
+
+/**
+ * Generate a random webhook path token (32 hex chars).
+ */
+function generateWebhookToken() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+/**
+ * Ensure every repository has a webhook_token (backfills legacy rows).
+ */
+async function backfillWebhookTokens() {
+  const { data, error } = await supabase
+    .from("repositories")
+    .select("id")
+    .or("webhook_token.is.null,webhook_token.eq.");
+  if (error) throw error;
+
+  for (const row of data || []) {
+    const { error: updErr } = await supabase
+      .from("repositories")
+      .update({ webhook_token: generateWebhookToken() })
+      .eq("id", row.id);
+    if (updErr) throw updErr;
+    console.log(`[db] Generated webhook token for repository #${row.id}`);
+  }
 }
 
 /**
@@ -53,6 +86,7 @@ async function addRepository(guildId, owner, name, channelId, createdBy, options
       created_by: createdBy,
       github_token_id: options.tokenId || null,
       webhook_secret: options.webhookSecret || null,
+      webhook_token: options.webhookToken || generateWebhookToken(),
       poll_enabled: options.pollEnabled || false,
     })
     .select()
@@ -93,6 +127,21 @@ async function getRepositoryByFullName(guildId, fullName) {
     .single();
 
   if (error && error.code !== "PGRST116") throw error;
+  return data;
+}
+
+/**
+ * Get repository by its random webhook path token
+ */
+async function getRepositoryByWebhookToken(token) {
+  if (!token || typeof token !== "string") return null;
+  const { data, error } = await supabase
+    .from("repositories")
+    .select("*")
+    .eq("webhook_token", token)
+    .maybeSingle();
+
+  if (error) throw error;
   return data;
 }
 
@@ -270,7 +319,7 @@ async function addToken(guildId, token, userId, description, isDefault = false) 
       .eq("guild_id", guildId);
   }
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from("github_tokens")
     .insert({
       guild_id: guildId,
@@ -278,9 +327,12 @@ async function addToken(guildId, token, userId, description, isDefault = false) 
       user_id: userId,
       description,
       is_default: isDefault,
-    });
+    })
+    .select()
+    .single();
 
   if (error) throw error;
+  return data;
 }
 
 /**
@@ -339,15 +391,19 @@ async function getAllTokens(guildId) {
 }
 
 /**
- * Remove a token
+ * Remove a token (guild-scoped — a guild can only delete its own tokens)
+ * @returns {Promise<boolean>} true if a row was deleted
  */
-async function removeToken(id) {
-  const { error } = await supabase
+async function removeToken(id, guildId) {
+  const query = supabase
     .from("github_tokens")
-    .delete()
+    .delete({ count: "exact" })
     .eq("id", id);
+  if (guildId) query.eq("guild_id", guildId);
 
+  const { count, error } = await query;
   if (error) throw error;
+  return count > 0;
 }
 
 // ─── Guild Operations ───────────────────────────────────────────────────────
@@ -387,6 +443,7 @@ async function getGuildStats(guildId) {
 
 module.exports = {
   init,
+  generateWebhookToken,
   ensureGuild,
   // Guild
   getGuild,
@@ -396,6 +453,7 @@ module.exports = {
   addRepository,
   getRepositoryById,
   getRepositoryByFullName,
+  getRepositoryByWebhookToken,
   getAllRepositories,
   getPollableRepositories,
   getAllPollableRepositories,
